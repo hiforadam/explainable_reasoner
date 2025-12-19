@@ -1,10 +1,12 @@
 import argparse
 import json
+import os
+from typing import Dict, Any
 
 from reasoner.data import load_examples, load_token_descriptions, write_jsonl
 from reasoner.tokenizer import ClosedVocabTokenizer
 from reasoner.train import train_reasoner, train_dual
-from reasoner.model import ReasonerArtifacts
+from reasoner.model import ReasonerArtifacts, CriticArtifacts
 from reasoner.selector import SelectorArtifacts
 from reasoner.generate import generate, generate_dual
 
@@ -37,7 +39,7 @@ def cmd_train_dual(args):
     ex = load_examples(args.data)
     texts = [t for _, t in ex]
     token_desc = load_token_descriptions(args.token_desc) if args.token_desc else {}
-    reasoner, selector = train_dual(
+    reasoner, selector, critic, metrics = train_dual(
         texts=texts,
         token_desc=token_desc,
         dim=args.dim,
@@ -48,8 +50,10 @@ def cmd_train_dual(args):
     )
     reasoner.save(args.artifacts)
     selector.save(args.artifacts)
+    critic.save(args.artifacts)
     print(f"[train-dual] reasoner vocab={len(reasoner.vocab)} dim={reasoner.vectors.shape[1]} saved to {args.artifacts}")
     print(f"[train-dual] selector contexts={len(selector.trigram_logp)} (trigram) + {len(selector.bigram_logp)} (bigram) saved to {args.artifacts}")
+    print(f"[train-dual] critic saved to {args.artifacts} (loss={metrics.get('critic_loss', 0.0):.4f})")
 
 
 def cmd_generate(args):
@@ -75,6 +79,12 @@ def cmd_generate(args):
         cluster_switch_penalty=args.cluster_switch_penalty,
     )
     print(out["text"])
+    if out.get("gate") is not None:
+        gate = out.get("gate")
+        prof = (gate.get("contradiction_profile") or {})
+        print("\n--- REASONING GATE ---")
+        print(json.dumps({"coverage_score": gate.get("coverage_score"), "veto": prof.get("veto"), "veto_reasons": prof.get("veto_reasons"), "attempt": gate.get("attempt")}, ensure_ascii=False, indent=2))
+
     if args.explain:
         print("\n--- EXPLANATION (top candidates per step) ---")
         print(json.dumps(out["explain"], ensure_ascii=False, indent=2))
@@ -108,6 +118,12 @@ def cmd_generate_dual(args):
         num_continuations=args.num_continuations,
         commit_len=args.commit_len,
         w_meta_frame=args.w_meta_frame,
+        refine_rounds=args.refine_rounds,
+        max_attempts=args.max_attempts,
+        seed=args.seed,
+        candidate_temperature=args.candidate_temperature,
+        final_temperature=args.final_temperature,
+
     )
     print(out["text"])
     if args.explain:
@@ -116,29 +132,6 @@ def cmd_generate_dual(args):
         print("\n--- ONLINE STATE ---")
         print(json.dumps(out.get("online", {}), ensure_ascii=False, indent=2))
 
-
-def cmd_finetune(args):
-    try:
-        from reasoner.finetune.data import load_io_jsonl
-        from reasoner.finetune.finetune import finetune_reasoner
-    except ImportError:
-        raise ImportError("Finetune module not found. Please ensure reasoner/finetune/data.py and reasoner/finetune/finetune.py exist.")
-    base = ReasonerArtifacts.load(args.base_artifacts)
-    pairs = load_io_jsonl(args.data, input_key=args.input_key, output_key=args.output_key)
-    token_desc = load_token_descriptions(args.token_desc) if args.token_desc else {}
-    art = finetune_reasoner(
-        base=base,
-        io_pairs=pairs,
-        token_desc=token_desc,
-        window=args.window,
-        mix_bigram=args.mix_bigram,
-        mix_vectors=args.mix_vectors,
-        corruption_swaps=args.corruption_swaps,
-        corruption_quantile=args.corruption_quantile,
-        seed=args.seed,
-    )
-    art.save(args.out_artifacts)
-    print(f"[finetune] wrote updated artifacts to: {args.out_artifacts} (pairs={len(pairs)})")
 
 
 def cmd_vocab(args):
@@ -177,21 +170,6 @@ def main():
     p_td.add_argument("--selector_smooth", type=float, default=0.5)
     p_td.add_argument("--selector_max_per_context", type=int, default=256)
     p_td.set_defaults(func=cmd_train_dual)
-
-    p_ft = sub.add_parser("finetune")
-    p_ft.add_argument("--base_artifacts", required=True, help="Path to existing artifacts directory (pretraining)")
-    p_ft.add_argument("--data", required=True, help="JSONL with conversation input/output pairs")
-    p_ft.add_argument("--input_key", default="input", help="JSON key for the input field")
-    p_ft.add_argument("--output_key", default="output", help="JSON key for the output field")
-    p_ft.add_argument("--token_desc", required=False, default="", help="Optional token_descriptions.jsonl for manual descriptions")
-    p_ft.add_argument("--out_artifacts", required=True, help="Output artifacts directory for finetuned model")
-    p_ft.add_argument("--window", type=int, default=2, help="Co-occurrence window used for PPMI vectors and cooc stats")
-    p_ft.add_argument("--mix_bigram", type=float, default=0.35, help="Mix ratio for updating bigram transitions (0..1)")
-    p_ft.add_argument("--mix_vectors", type=float, default=0.35, help="Mix ratio for updating semantic vectors (0..1)")
-    p_ft.add_argument("--corruption_swaps", type=int, default=2, help="Strength of structural corruption used to derive incoherence signals")
-    p_ft.add_argument("--corruption_quantile", type=float, default=0.995, help="Quantile for selecting corrupted-heavy transitions (0.5..0.9999)")
-    p_ft.add_argument("--seed", type=int, default=7)
-    p_ft.set_defaults(func=cmd_finetune)
 
     p_ge = sub.add_parser("generate")
     p_ge.add_argument("--artifacts", required=True)
@@ -239,6 +217,13 @@ def main():
     p_gd.add_argument("--num_continuations", type=int, default=12, help="How many continuations to sample per step")
     p_gd.add_argument("--commit_len", type=int, default=1, help="How many tokens to commit from the chosen continuation per step")
     p_gd.add_argument("--w_meta_frame", type=float, default=0.45, help="Penalty weight for meta framing roles at the continuation level")
+
+    # Deprecated: Reasoning Gate parameters (kept for compatibility, but disabled for performance)
+    p_gd.add_argument("--refine_rounds", type=int, default=0, help="[DEPRECATED] Disabled for performance. Use 0.")
+    p_gd.add_argument("--max_attempts", type=int, default=1, help="[DEPRECATED] Disabled for performance. Use 1.")
+    p_gd.add_argument("--seed", type=int, default=None, help="[DEPRECATED] RNG seed (optional).")
+    p_gd.add_argument("--candidate_temperature", type=float, default=None, help="[DEPRECATED] Not used.")
+    p_gd.add_argument("--final_temperature", type=float, default=None, help="[DEPRECATED] Not used.")
 
     p_gd.set_defaults(func=cmd_generate_dual)
 
