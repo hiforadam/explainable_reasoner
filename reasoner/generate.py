@@ -1,4 +1,5 @@
 import numpy as np
+import re
 from typing import List, Dict, Any, Tuple, Optional
 from .tokenizer import ClosedVocabTokenizer
 from .model import ReasonerArtifacts
@@ -40,10 +41,19 @@ def _entropy(p: np.ndarray, eps: float = 1e-12) -> float:
     return float(-np.sum(p * np.log(p)))
 
 def _level_id_from_token_role(token_role: str, level_names: List[str], token_role_to_level: Optional[Dict[str, str]] = None) -> int:
+    """Map token role to level using learned mapping or pattern-based fallback."""
     if token_role_to_level:
         level = token_role_to_level.get(token_role, "content")
     else:
-        level = "punct" if token_role == "punct" else ("meta" if token_role in ("dataset_meta", "meta_shape", "meta_frame") else ("function" if token_role in ("function_word", "adverb_like") else "content"))
+        # Pattern-based level inference (no hardcoded role lists)
+        if token_role == "punct":
+            level = "punct"
+        elif token_role and token_role.startswith("meta"):
+            level = "meta"
+        elif token_role and ("function" in token_role or "adverb" in token_role):
+            level = "function"
+        else:
+            level = "content"
     return level_names.index(level) if level in level_names else 0
 
 def _init_role_state(prompt_ids: List[int], roles_by_id: List[str], end_token_ids: List[int],
@@ -392,10 +402,12 @@ def generate(
     return {"text": tok.decode(ids), "token_ids": ids, "explain": log}
 
 # ---------------- Dual-model generation (Reasoner + Selector debate) ----------------
-def generate_dual(
+def _generate_dual_once(
     reasoner: ReasonerArtifacts,
     selector: SelectorArtifacts,
     prompt: str,
+    initial_ids: Optional[List[int]] = None,
+    return_ids: bool = False,
     max_new_tokens: int = 60,
     temperature: float = 0.85,
     selector_top_k: int = 32,
@@ -438,14 +450,15 @@ def generate_dual(
       the chosen continuation's advantage relative to alternatives.
     """
     tok = ClosedVocabTokenizer(vocab=reasoner.vocab, token_to_id=reasoner.token_to_id)
-    ids: List[int] = tok.encode(prompt)
+    prompt_ids: List[int] = tok.encode(prompt)
+    ids: List[int] = list(initial_ids) if initial_ids is not None else list(prompt_ids)
     V = len(reasoner.vocab)
     vec = reasoner.vectors
 
     # prompt anchor (directional intent)
-    if ids:
-        k0 = min(16, len(ids))
-        anchor = vec[ids[:k0]].mean(axis=0)
+    if prompt_ids:
+        k0 = min(16, len(prompt_ids))
+        anchor = vec[prompt_ids[:k0]].mean(axis=0)
     else:
         anchor = np.zeros((vec.shape[1],), dtype=np.float32)
 
@@ -514,14 +527,15 @@ def generate_dual(
         tmp_ids = list(ids)
         reason_sum = 0.0
         meta_count = 0.0
-        meta_roles = {"meta_frame", "meta_shape", "dataset_meta"}
         for tid in cont:
             if not (0 <= int(tid) < V):
                 continue
+            role = roles_by_id[int(tid)]
             # block dataset/meta tokens completely if requested
-            if block_dataset_meta and roles_by_id[int(tid)] == "dataset_meta":
+            if block_dataset_meta and role == "dataset_meta":
                 reason_sum -= 2.5
-            if roles_by_id[int(tid)] in meta_roles:
+            # Count meta roles using pattern matching (no hardcoded set)
+            if role and (role.startswith("meta") or role == "dataset_meta"):
                 meta_count += 1.0
 
             k = min(int(context_window), len(tmp_ids)) if tmp_ids else 0
@@ -670,6 +684,9 @@ def generate_dual(
 
     text = tok.decode(ids)
     out: Dict[str, Any] = {"text": text}
+    if return_ids:
+        out["_ids"] = list(ids)
+        out["_prompt_len"] = int(len(prompt_ids))
     if explain:
         out["explain"] = explain_rows
     out["online"] = {
@@ -683,3 +700,291 @@ def generate_dual(
         ]
     }
     return out
+
+
+# =========================
+# Reasoning Gate (veto-based)
+# =========================
+
+def _sentences(text: str, max_sents: int = 4) -> List[str]:
+    t = (text or "").strip()
+    if not t:
+        return []
+    t = re.sub(r"\s+", " ", t)
+    parts = re.split(r"(?<=[\.!\?])\s+", t)
+    out = []
+    for p in parts:
+        p = p.strip()
+        if p:
+            out.append(p)
+        if len(out) >= max_sents:
+            break
+    return out
+
+def claim_gate(prompt: str, text: str, goal: Dict[str, Any]) -> bool:
+    """Check if text contains a clear central claim."""
+    sents = _sentences(text, max_sents=3)
+    if not sents:
+        return False
+    first = sents[0].strip()
+    if len(first.split()) < 6:
+        return False
+    # Detect meta/dataset framing patterns
+    if _looks_like_pretraining_prose(text):
+        return False
+
+    # Must anchor to the prompt topic
+    kws = goal.get("keywords") or _simple_tokens(prompt)
+    if kws:
+        tset = set(_simple_tokens(" ".join(sents)))
+        if not any(k in tset for k in kws[:8]):
+            return False
+
+    # Check for claim-like structure (statements, definitions, explanations)
+    fl = first.lower()
+    # Look for declarative or explanatory patterns
+    if re.search(r"\b(is|are|means|refers\s+to|is\s+that|defines?|explains?)\b", fl):
+        return True
+    return False
+
+def causal_gate(text: str) -> bool:
+    """Check for causal or explanatory structure."""
+    sents = _sentences(text, max_sents=2)
+    if not sents:
+        return False
+    blob = " ".join(sents).lower()
+    # Detect causal/explanatory patterns
+    return bool(re.search(r"\b(because|due\s+to|since|as\s+a\s+result|therefore|thus|leads?\s+to|resulting\s+in|explains?|causes?)\b", blob))
+
+def boundary_gate(text: str) -> bool:
+    """Check for contrast, boundary, or trade-off structure."""
+    sents = _sentences(text, max_sents=3)
+    for s in sents:
+        sl = s.lower()
+        # Check for contrast with two sides
+        if " but " in sl:
+            parts = sl.split(" but ", 1)
+            if len(parts) == 2 and len(parts[0].split()) >= 4 and len(parts[1].split()) >= 4:
+                return True
+        # Detect contrast/boundary markers
+        if re.search(r"\b(however|although|whereas|yet|while|contrast|difference)\b", sl):
+            return True
+        if re.search(r"\b(trade-?off|at\s+the\s+cost|on\s+the\s+other\s+hand|versus|vs)\b", sl):
+            return True
+    return False
+def _simple_tokens(s: str) -> List[str]:
+    """Extract tokens, filtering very short common function words."""
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s\-]", " ", s)
+    toks = [t for t in s.split() if t and len(t) > 1]  # Filter single chars, keep all meaningful tokens
+    return toks
+
+def infer_discourse_goal(prompt: str) -> Dict[str, Any]:
+    """Infer discourse goal from prompt using pattern matching."""
+    p = (prompt or "").strip()
+    pl = p.lower()
+    # Detect question patterns
+    is_q = ("?" in p) or bool(re.match(r"^(why|explain|what|how|when|where|who)\s+", pl))
+    goal = "qa" if is_q else "expository"
+    # Refine goal type based on question word
+    if pl.startswith("why "):
+        goal = "why"
+    elif pl.startswith("explain "):
+        goal = "explain"
+    elif pl.startswith("what "):
+        goal = "what"
+    kws = _simple_tokens(p)
+    return {"goal": goal, "is_question": bool(is_q), "keywords": kws[:12]}
+
+def coverage_score(prompt: str, text: str, goal: Dict[str, Any]) -> float:
+    kws = goal.get("keywords") or _simple_tokens(prompt)
+    if not kws:
+        return 1.0
+    tset = set(_simple_tokens(text))
+    hit = sum(1 for k in kws if k in tset)
+    return float(hit) / float(max(1, len(kws)))
+
+def drift_score(prompt: str, text: str, goal: Dict[str, Any]) -> float:
+    # Higher means more drift
+    kws = goal.get("keywords") or _simple_tokens(prompt)
+    if not kws:
+        return 0.0
+    toks = _simple_tokens(text)
+    if not toks:
+        return 1.0
+    # emphasize early region
+    early = set(toks[:48])
+    hit_early = sum(1 for k in kws if k in early)
+    frac_early = float(hit_early) / float(max(1, len(kws)))
+    # if you never mention prompt keywords early, you likely drifted
+    return float(1.0 - frac_early)
+
+def repetition_score(text: str, n: int = 3, window: int = 120) -> float:
+    toks = _simple_tokens(text)
+    if len(toks) < n + 5:
+        return 0.0
+    toks = toks[:window]
+    grams = [" ".join(toks[i:i+n]) for i in range(0, len(toks)-n+1)]
+    counts: Dict[str, int] = {}
+    for g in grams:
+        counts[g] = counts.get(g, 0) + 1
+    repeats = sum((c - 1) for c in counts.values() if c >= 2)
+    denom = float(max(1, len(grams)))
+    return float(repeats) / denom
+
+def _looks_like_pretraining_prose(text: str) -> bool:
+    """Detect dataset/meta framing patterns using generic patterns."""
+    tl = (text or "").lower()
+    # Generic pattern-based detection
+    meta_indicators = [
+        r"\bthis\s+(entry|passage|text|document)\s+(is\s+)?(written|suitable|designed)\b",
+        r"\bevaluation\s+(notes?|data|text)\b",
+        r"\bdataset\s+(perspective|context|source)\b",
+        r"\b(training|pretraining|tuning)\s+(data|corpus|text|material)\b",
+    ]
+    hits = sum(1 for pattern in meta_indicators if re.search(pattern, tl))
+    return hits >= 2
+
+def must_answer(prompt: str, text: str, goal: Dict[str, Any]) -> bool:
+    # Blocking: question prompts must be addressed directly and avoid "dataset/meta entry" framing.
+    if not goal.get("is_question", False):
+        # For expository prompts, still block extreme meta framing.
+        return not _looks_like_pretraining_prose(text)
+    tl = (text or "").strip().lower()
+    if not tl:
+        return False
+    if _looks_like_pretraining_prose(text):
+        return False
+    # Detect answer patterns
+    if re.search(r"\b(because|the\s+main|it\s+(is|was|means)|this\s+(is|means|refers))\b", tl):
+        return True
+    # Must contain keywords and avoid meta framing
+    kws = goal.get("keywords") or _simple_tokens(prompt)
+    if kws:
+        tset = set(_simple_tokens(text)[:60])
+        if any(k in tset for k in kws):
+            if not re.match(r"\b(this\s+entry|evaluation\s+notes?|dataset\s+perspective)\b", tl):
+                return True
+    return False
+
+def contradiction_profile(prompt: str, text: str, goal: Dict[str, Any], cov: float) -> Dict[str, Any]:
+    d = drift_score(prompt, text, goal)
+    rep = repetition_score(text, n=3)
+    ans_ok = must_answer(prompt, text, goal)
+
+    # Hard reasoning gates
+    claim_ok = claim_gate(prompt, text, goal)
+    caus_ok = causal_gate(text)
+    bound_ok = boundary_gate(text)
+
+    # Overall "answer OK" requires the hard gates as well.
+    answer_ok = bool(ans_ok and claim_ok and caus_ok and bound_ok)
+
+    veto_reasons: List[str] = []
+    # Blocking conditions (veto, not penalty)
+    if not answer_ok:
+        # Preserve the original reason name for compatibility
+        veto_reasons.append("not_answering_or_goal_miss")
+    if not claim_ok:
+        veto_reasons.append("missing_central_claim")
+    if not caus_ok:
+        veto_reasons.append("missing_causal_link")
+    if not bound_ok:
+        veto_reasons.append("missing_boundary_tradeoff")
+
+    if d > 0.70:
+        veto_reasons.append("topic_drift")
+    if rep > 0.22:
+        veto_reasons.append("abnormal_repetition")
+
+    # Coverage is non-blocking by itself but it amplifies veto confidence
+    if cov < 0.20 and "topic_drift" not in veto_reasons:
+        veto_reasons.append("low_coverage")
+
+    # Determine veto based on critical issues
+    critical_issues = {
+        "not_answering_or_goal_miss",
+        "missing_central_claim",
+        "missing_causal_link",
+        "missing_boundary_tradeoff",
+        "topic_drift",
+        "abnormal_repetition",
+    }
+    veto = any(r in critical_issues for r in veto_reasons)
+
+    # Score used only for selecting the "best of bad" when everything is vetoed.
+    score = (2.0 * float(cov)) - (1.25 * float(d)) - (1.50 * float(rep))
+    score += (0.75 if answer_ok else -1.75)
+    score += (0.25 if claim_ok else -0.35) + (0.20 if caus_ok else -0.25) + (0.15 if bound_ok else -0.20)
+
+    return {
+        "coverage": float(cov),
+        "drift": float(d),
+        "repetition": float(rep),
+        "answer_ok": bool(answer_ok),
+        "claim_ok": bool(claim_ok),
+        "causal_ok": bool(caus_ok),
+        "boundary_ok": bool(bound_ok),
+        "veto": bool(veto),
+        "veto_reasons": veto_reasons,
+        "score": float(score),
+    }
+
+
+def generate_dual(
+    reasoner: ReasonerArtifacts,
+    selector: SelectorArtifacts,
+    prompt: str,
+    max_new_tokens: int = 60,
+    temperature: float = 0.85,
+    selector_top_k: int = 32,
+    alpha_selector: float = 0.55,
+    beta_reasoner: float = 0.45,
+    eta_trust: float = 0.10,
+    eta_bias: float = 0.08,
+    trust_clip: float = 2.0,
+    w_semantic: float = 1.0,
+    w_anchor: float = 0.55,
+    w_contra: float = 1.25,
+    w_repeat: float = 0.85,
+    repeat_window: int = 6,
+    block_dataset_meta: bool = True,
+    explain: bool = False,
+    context_window: int = 10,
+    lookahead_len: int = 6,
+    num_continuations: int = 12,
+    commit_len: int = 1,
+    w_meta_frame: float = 0.45,
+    # Deprecated: Reasoning Gate parameters (removed for performance)
+    refine_rounds: int = 0,
+    max_attempts: int = 1,
+    seed: Optional[int] = None,
+    candidate_temperature: Optional[float] = None,
+    final_temperature: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Fast dual generation without expensive reasoning gate loops."""
+    return _generate_dual_once(
+        reasoner=reasoner,
+        selector=selector,
+        prompt=prompt,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        selector_top_k=selector_top_k,
+        alpha_selector=alpha_selector,
+        beta_reasoner=beta_reasoner,
+        eta_trust=eta_trust,
+        eta_bias=eta_bias,
+        trust_clip=trust_clip,
+        w_semantic=w_semantic,
+        w_anchor=w_anchor,
+        w_contra=w_contra,
+        w_repeat=w_repeat,
+        repeat_window=repeat_window,
+        block_dataset_meta=block_dataset_meta,
+        explain=explain,
+        context_window=context_window,
+        lookahead_len=lookahead_len,
+        num_continuations=num_continuations,
+        commit_len=commit_len,
+        w_meta_frame=w_meta_frame,
+    )

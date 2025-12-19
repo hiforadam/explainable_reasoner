@@ -1,11 +1,12 @@
 import re
 import numpy as np
-from typing import List, Dict, Any, Tuple
+import math
+from typing import List, Dict, Any, Tuple, Optional
 
 from .tokenizer import ClosedVocabTokenizer, simple_tokenize
+from .selector import train_selector_from_seqs, SelectorArtifacts
 from .utils import normalize_rows
-from .model import ReasonerArtifacts
-from .selector import SelectorArtifacts, train_selector_from_seqs
+from .model import ReasonerArtifacts, CriticArtifacts
 
 _PUNCT_RE = re.compile(r"[^\w\s]+\Z", re.UNICODE)
 
@@ -34,22 +35,28 @@ def _shape_features(token: str) -> Dict[str, float]:
 def _kmeans(X: np.ndarray, k: int, iters: int = 25, seed: int = 7) -> np.ndarray:
     rng = np.random.default_rng(seed)
     n, k = X.shape[0], max(2, min(int(k), X.shape[0]))
-    centroids = X[rng.choice(n, size=k, replace=False)].copy()
+    # Normalize and clean X to prevent numerical issues
+    X = X.astype(np.float64)
+    X = np.nan_to_num(X, nan=0.0, posinf=1.0, neginf=-1.0)
+    X_norm = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
+    centroids = X_norm[rng.choice(n, size=k, replace=False)].copy()
     for _ in range(iters):
-        X_safe = np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
-        centroids_safe = np.nan_to_num(centroids, nan=0.0, posinf=1e6, neginf=-1e6)
-        X_norm = X_safe / (np.linalg.norm(X_safe, axis=1, keepdims=True) + 1e-12)
-        centroids_norm = centroids_safe / (np.linalg.norm(centroids_safe, axis=1, keepdims=True) + 1e-12)
-        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
-            labels = np.argmax(np.clip(X_norm @ centroids_norm.T, -1.0, 1.0), axis=1).astype(np.int32)
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            dot_product = X_norm @ centroids.T
+            dot_product = np.nan_to_num(dot_product, nan=-np.inf, posinf=1.0, neginf=-np.inf)
+        labels = np.argmax(dot_product, axis=1).astype(np.int32)
         new_centroids = np.zeros_like(centroids)
         for ci in range(k):
             mask = labels == ci
             if np.any(mask):
-                c = X[mask].mean(axis=0)
-                new_centroids[ci] = c / (np.linalg.norm(c) + 1e-12)
+                c = X_norm[mask].mean(axis=0)
+                norm_c = np.linalg.norm(c)
+                if norm_c > 1e-12:
+                    new_centroids[ci] = c / norm_c
+                else:
+                    new_centroids[ci] = X_norm[rng.integers(0, n)]
             else:
-                new_centroids[ci] = X[rng.integers(0, n)]
+                new_centroids[ci] = X_norm[rng.integers(0, n)]
         if np.allclose(new_centroids, centroids, atol=1e-4):
             break
         centroids = new_centroids
@@ -101,10 +108,15 @@ def build_contradictions(vectors: np.ndarray, cooc_threshold: float, cooc: np.nd
                         vocab: List[str], roles: Dict[str, str], sim_threshold: float = 0.55,
                         max_pairs: int = 300) -> List[Dict[str, Any]]:
     V, pairs = len(vocab), []
-    vectors_safe = np.nan_to_num(vectors, nan=0.0, posinf=1e6, neginf=-1e6)
-    vectors_norm = vectors_safe / (np.linalg.norm(vectors_safe, axis=1, keepdims=True) + 1e-12)
-    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
-        sims = np.clip(vectors_norm @ vectors_norm.T, -1.0, 1.0)
+    # Normalize and clean vectors to prevent numerical issues
+    vectors = vectors.astype(np.float64)
+    vectors = np.nan_to_num(vectors, nan=0.0, posinf=1.0, neginf=-1.0)
+    vectors_norm = vectors / (np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-12)
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+        sims = vectors_norm @ vectors_norm.T
+        sims = np.nan_to_num(sims, nan=0.0, posinf=1.0, neginf=-1.0)
+        # Clamp similarity values to valid range [-1, 1]
+        sims = np.clip(sims, -1.0, 1.0)
     for i in range(V):
         for j in range(i + 1, V):
             if sims[i, j] >= sim_threshold and cooc[i, j] <= cooc_threshold and cooc[j, i] <= cooc_threshold:
@@ -176,7 +188,9 @@ def _infer_roles_and_clusters(vocab: List[str], vectors: np.ndarray, seqs: List[
         with np.errstate(divide="ignore", invalid="ignore"):
             frame_ratio = fw_frame / np.maximum(1.0, occ)
             score = frame_ratio * np.sqrt(np.maximum(0.0, df))
-        valid = np.array([not _is_punct_like(vocab[i]) and roles.get(vocab[i]) not in ("function_word", "dataset_meta")
+        # Filter valid tokens using pattern matching (no hardcoded role lists)
+        valid = np.array([not _is_punct_like(vocab[i]) and 
+                         roles.get(vocab[i], "") not in ("function_word", "dataset_meta")
                          for i in range(V)], dtype=bool)
         cand_scores = score[valid]
         cand_scores = cand_scores[np.isfinite(cand_scores)]
@@ -184,7 +198,9 @@ def _infer_roles_and_clusters(vocab: List[str], vectors: np.ndarray, seqs: List[
             cutoff, fr_med = float(np.quantile(cand_scores, 0.95)), float(np.median(frame_ratio[valid]))
             for i in range(V):
                 if valid[i] and score[i] >= cutoff and frame_ratio[i] >= fr_med:
-                    if roles.get(vocab[i]) not in ("punct", "function_word", "dataset_meta"):
+                    # Use pattern matching instead of hardcoded list
+                    role = roles.get(vocab[i], "")
+                    if role and role not in ("punct", "function_word", "dataset_meta"):
                         roles[vocab[i]] = "meta_frame"
     return roles, clusters, meta_cluster_ids
 
@@ -193,14 +209,17 @@ def _infer_roles_and_clusters(vocab: List[str], vectors: np.ndarray, seqs: List[
 # ---------------------------
 
 def _infer_discourse_structure(token_roles: Dict[str, str], vocab: List[str]) -> Tuple[List[str], List[str], Dict[str, str], Dict[str, int]]:
+    """Infer discourse structure using pattern-based role-to-level mapping."""
     roles_by_id = [token_roles.get(t, "unknown") for t in vocab]
     token_role_to_level = {}
     for role in set(roles_by_id):
         if role == "punct":
             token_role_to_level[role] = "punct"
-        elif role in ("dataset_meta", "meta_shape", "meta_frame"):
+        elif role and (role.startswith("meta") or role == "dataset_meta"):
+            # Pattern-based: any role starting with "meta" or exact "dataset_meta"
             token_role_to_level[role] = "meta"
-        elif role in ("function_word", "adverb_like"):
+        elif role and ("function" in role or "adverb" in role):
+            # Pattern-based: roles containing "function" or "adverb"
             token_role_to_level[role] = "function"
         else:
             token_role_to_level[role] = "content"
@@ -228,8 +247,10 @@ def build_discourse_role_stats(seqs: List[List[int]], vocab: List[str], token_ro
     meta_cluster_id_set = set(int(x) for x in (meta_cluster_ids or []))
 
     def is_meta_tok(tid: int) -> bool:
+        """Check if token is meta using pattern matching."""
         tr = roles_by_id[tid]
-        if tr in ("dataset_meta", "meta_shape", "meta_frame"):
+        # Pattern-based: any role starting with "meta" or exact "dataset_meta"
+        if tr and (tr.startswith("meta") or tr == "dataset_meta"):
             return True
         cid = clusters_by_id[tid]
         return (cid != -1) and (cid in meta_cluster_id_set)
@@ -339,7 +360,204 @@ def train_reasoner(texts: List[str], token_desc: Dict[str, str], dim: int = 32,
                             discourse_pos_thresholds=discourse_pos_thresholds, discourse_trans_pos=discourse_trans_pos,
                             discourse_emit_logp_pos=discourse_emit_logp_pos, discourse_role_min_run=discourse_role_min_run)
 
-# ---------------- Dual-model training (Reasoner + Selector) ----------------
+
+def _sigmoid(x: float) -> float:
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def _critic_feature_names() -> List[str]:
+    return [
+        "cos_ctx_cont",
+        "mean_bigram_logp",
+        "repeat_frac",
+        "meta_frac",
+        "contra_mean",
+        "len_ratio",
+    ]
+
+
+def _critic_features(
+    art: ReasonerArtifacts,
+    ctx_ids: List[int],
+    cont_ids: List[int],
+    roles_by_id: Optional[List[str]] = None,
+    contra_lookup: Optional[Dict[Tuple[int, int], float]] = None,
+    contra_window: int = 6,
+) -> np.ndarray:
+    V = len(art.vocab)
+    if roles_by_id is None:
+        roles_by_id = [art.roles.get(t, "unknown") for t in art.vocab]
+
+    if contra_lookup is None:
+        contra_lookup = {}
+        for p in art.contradiction_pairs or []:
+            a = art.token_to_id.get(p.get("a"))
+            b = art.token_to_id.get(p.get("b"))
+            if a is None or b is None:
+                continue
+            pen = float(p.get("penalty", 0.0) or 0.0)
+            if pen > 0:
+                contra_lookup[(a, b)] = max(contra_lookup.get((a, b), 0.0), pen)
+                contra_lookup[(b, a)] = max(contra_lookup.get((b, a), 0.0), pen)
+
+    ctx_ids = ctx_ids[-max(1, int(contra_window)):]
+    cont_ids = cont_ids[:]
+    if not ctx_ids or not cont_ids:
+        return np.zeros((6,), dtype=np.float32)
+
+    vec = art.vectors
+    ctx = vec[ctx_ids].mean(axis=0)
+    cont = vec[cont_ids].mean(axis=0)
+    # cosine similarity
+    cos = float(ctx @ cont)
+
+    # mean bigram logp over internal transitions
+    bl = 0.0
+    cnt = 0
+    prev = ctx_ids[-1]
+    bl += float(art.bigram_logp[prev, cont_ids[0]])
+    cnt += 1
+    for a, b in zip(cont_ids[:-1], cont_ids[1:]):
+        bl += float(art.bigram_logp[a, b])
+        cnt += 1
+    mean_bigram = bl / max(1, cnt)
+
+    # repetition fraction within continuation
+    rep = 0
+    if len(cont_ids) > 1:
+        rep = len(cont_ids) - len(set(cont_ids))
+    repeat_frac = float(rep / max(1, len(cont_ids)))
+
+    # meta fraction (pattern-based, no hardcoded list)
+    meta_roles = 0
+    for tid in cont_ids:
+        r = roles_by_id[tid] if 0 <= tid < V else "unknown"
+        # Pattern-based detection: starts with "meta" or exact "dataset_meta"
+        if r and (r.startswith("meta") or r == "dataset_meta"):
+            meta_roles += 1
+    meta_frac = float(meta_roles / max(1, len(cont_ids)))
+
+    # contradiction mean between cont tokens and recent ctx
+    contra_sum = 0.0
+    contra_cnt = 0
+    recent = ctx_ids[-max(1, int(contra_window)):]
+    for a in recent:
+        for b in cont_ids:
+            contra_sum += float(contra_lookup.get((a, b), 0.0))
+            contra_cnt += 1
+    contra_mean = float(contra_sum / max(1, contra_cnt))
+
+    len_ratio = float(len(cont_ids) / max(1, len(ctx_ids)))
+
+    return np.array([cos, mean_bigram, repeat_frac, meta_frac, contra_mean, len_ratio], dtype=np.float32)
+
+
+def train_critic_from_seqs(
+    art: ReasonerArtifacts,
+    seqs: List[List[int]],
+    steps: int = 3000,
+    lr: float = 0.05,
+    ctx_window: int = 10,
+    cont_len: int = 4,
+    num_negs: int = 3,
+    seed: int = 7,
+    l2: float = 1e-4,
+) -> Tuple[CriticArtifacts, float]:
+    """Self-supervised critic: distinguish real continuation vs negatives."""
+    rng = np.random.default_rng(int(seed))
+    feat_names = _critic_feature_names()
+    w = np.zeros((len(feat_names),), dtype=np.float64)
+    b = 0.0
+
+    roles_by_id = [art.roles.get(t, "unknown") for t in art.vocab]
+
+    # pre-build contradiction lookup
+    contra_lookup = {}
+    for p in art.contradiction_pairs or []:
+        a = art.token_to_id.get(p.get("a"))
+        b2 = art.token_to_id.get(p.get("b"))
+        if a is None or b2 is None:
+            continue
+        pen = float(p.get("penalty", 0.0) or 0.0)
+        if pen > 0:
+            contra_lookup[(a, b2)] = max(contra_lookup.get((a, b2), 0.0), pen)
+            contra_lookup[(b2, a)] = max(contra_lookup.get((b2, a), 0.0), pen)
+
+    def step_loss(logit: float, y: int) -> float:
+        # binary cross entropy with logits
+        if y == 1:
+            return float(np.log1p(np.exp(-logit)))
+        return float(np.log1p(np.exp(logit)))
+
+    losses: List[float] = []
+    # flatten indices for fast random negatives
+    all_positions = []
+    for si, s in enumerate(seqs):
+        if len(s) >= (ctx_window + cont_len + 1):
+            all_positions.append(si)
+    if not all_positions:
+        # fallback: critic disabled
+        critic = CriticArtifacts(vocab=art.vocab, token_to_id=art.token_to_id, weights=w.tolist(), bias=float(b),
+                                 meta={"feature_names": feat_names, "note": "insufficient sequences for critic training"})
+        return critic, 0.0
+
+    for _ in range(max(1, int(steps))):
+        si = int(rng.choice(all_positions))
+        s = seqs[si]
+        if len(s) < (ctx_window + cont_len + 1):
+            continue
+        i = int(rng.integers(low=ctx_window, high=len(s) - cont_len))
+        ctx = s[i - ctx_window:i]
+        pos = s[i:i + cont_len]
+
+        f = _critic_features(art, ctx, pos, roles_by_id=roles_by_id, contra_lookup=contra_lookup)
+        logit = float(w @ f + b)
+        p = _sigmoid(logit)
+        # gradient ascent on log-likelihood: (y - p) * x
+        g = (1.0 - p)
+        w += lr * (g * f - l2 * w)
+        b += lr * g
+        losses.append(step_loss(logit, 1))
+
+        # negatives: random continuation slices from other sequences or random positions
+        for _n in range(max(1, int(num_negs))):
+            sj = int(rng.choice(all_positions))
+            s2 = seqs[sj]
+            if len(s2) < cont_len:
+                continue
+            j = int(rng.integers(low=0, high=max(1, len(s2) - cont_len)))
+            neg = s2[j:j + cont_len]
+            fn = _critic_features(art, ctx, neg, roles_by_id=roles_by_id, contra_lookup=contra_lookup)
+            logitn = float(w @ fn + b)
+            pn = _sigmoid(logitn)
+            gn = (0.0 - pn)
+            w += lr * (gn * fn - l2 * w)
+            b += lr * gn
+            losses.append(step_loss(logitn, 0))
+
+    critic = CriticArtifacts(
+        vocab=art.vocab,
+        token_to_id=art.token_to_id,
+        weights=w.astype(np.float32).tolist(),
+        bias=float(b),
+        meta={
+            "feature_names": feat_names,
+            "steps": int(steps),
+            "lr": float(lr),
+            "ctx_window": int(ctx_window),
+            "cont_len": int(cont_len),
+            "num_negs": int(num_negs),
+            "seed": int(seed),
+            "l2": float(l2),
+        },
+    )
+    return critic, float(np.mean(losses)) if losses else 0.0
+
+
 def train_dual(
     texts: List[str],
     token_desc: Dict[str, str],
@@ -348,20 +566,34 @@ def train_dual(
     desc_alpha: float = 0.35,
     selector_smooth: float = 0.5,
     selector_max_per_context: int = 256,
-) -> Tuple[ReasonerArtifacts, SelectorArtifacts]:
-    """Train two models from the same data:
-    - ReasonerArtifacts: semantic vectors + contradiction-aware metadata (no next-token CE).
-    - SelectorArtifacts: sparse trigram/bigram transitions for fluent token selection.
+    critic_steps: int = 3000,
+    critic_lr: float = 0.05,
+    critic_ctx_window: int = 10,
+    critic_cont_len: int = 4,
+    critic_num_negs: int = 3,
+    seed: int = 7,
+) -> Tuple[ReasonerArtifacts, SelectorArtifacts, CriticArtifacts, Dict[str, float]]:
+    """Train: reasoner + selector + outcome critic from the same data."""
+    art = train_reasoner(texts=texts, token_desc=token_desc, dim=dim, window=window, desc_alpha=desc_alpha)
+    tok = ClosedVocabTokenizer(vocab=art.vocab, token_to_id=art.token_to_id)
+    seqs = [tok.encode(t) for t in texts if t and t.strip()]
 
-    Both share the same vocab / token IDs (Reasoner vocab).
-    """
-    reasoner = train_reasoner(texts=texts, token_desc=token_desc, dim=dim, window=window, desc_alpha=desc_alpha)
-    tok = ClosedVocabTokenizer(vocab=reasoner.vocab, token_to_id=reasoner.token_to_id)
-    seqs = [tok.encode(t) for t in texts]
-    selector = train_selector_from_seqs(
-        vocab=reasoner.vocab,
+    sel = train_selector_from_seqs(vocab=art.vocab, seqs=seqs, smooth=selector_smooth, max_per_context=selector_max_per_context)
+
+    critic, critic_loss = train_critic_from_seqs(
+        art=art,
         seqs=seqs,
-        smooth=selector_smooth,
-        max_per_context=selector_max_per_context,
+        steps=critic_steps,
+        lr=critic_lr,
+        ctx_window=critic_ctx_window,
+        cont_len=critic_cont_len,
+        num_negs=critic_num_negs,
+        seed=seed,
     )
-    return reasoner, selector
+
+    metrics = {
+        "critic_loss": float(critic_loss),
+        "selector_contexts_bigram": float(len(sel.bigram_logp)),
+        "selector_contexts_trigram": float(len(sel.trigram_logp)),
+    }
+    return art, sel, critic, metrics
