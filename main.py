@@ -117,30 +117,6 @@ def cmd_generate_dual(args):
         print(json.dumps(out.get("online", {}), ensure_ascii=False, indent=2))
 
 
-def cmd_finetune(args):
-    try:
-        from reasoner.finetune.data import load_io_jsonl
-        from reasoner.finetune.finetune import finetune_reasoner
-    except ImportError:
-        raise ImportError("Finetune module not found. Please ensure reasoner/finetune/data.py and reasoner/finetune/finetune.py exist.")
-    base = ReasonerArtifacts.load(args.base_artifacts)
-    pairs = load_io_jsonl(args.data, input_key=args.input_key, output_key=args.output_key)
-    token_desc = load_token_descriptions(args.token_desc) if args.token_desc else {}
-    art = finetune_reasoner(
-        base=base,
-        io_pairs=pairs,
-        token_desc=token_desc,
-        window=args.window,
-        mix_bigram=args.mix_bigram,
-        mix_vectors=args.mix_vectors,
-        corruption_swaps=args.corruption_swaps,
-        corruption_quantile=args.corruption_quantile,
-        seed=args.seed,
-    )
-    art.save(args.out_artifacts)
-    print(f"[finetune] wrote updated artifacts to: {args.out_artifacts} (pairs={len(pairs)})")
-
-
 def cmd_vocab(args):
     ex = load_examples(args.data)
     texts = [t for _, t in ex]
@@ -177,21 +153,6 @@ def main():
     p_td.add_argument("--selector_smooth", type=float, default=0.5)
     p_td.add_argument("--selector_max_per_context", type=int, default=256)
     p_td.set_defaults(func=cmd_train_dual)
-
-    p_ft = sub.add_parser("finetune")
-    p_ft.add_argument("--base_artifacts", required=True, help="Path to existing artifacts directory (pretraining)")
-    p_ft.add_argument("--data", required=True, help="JSONL with conversation input/output pairs")
-    p_ft.add_argument("--input_key", default="input", help="JSON key for the input field")
-    p_ft.add_argument("--output_key", default="output", help="JSON key for the output field")
-    p_ft.add_argument("--token_desc", required=False, default="", help="Optional token_descriptions.jsonl for manual descriptions")
-    p_ft.add_argument("--out_artifacts", required=True, help="Output artifacts directory for finetuned model")
-    p_ft.add_argument("--window", type=int, default=2, help="Co-occurrence window used for PPMI vectors and cooc stats")
-    p_ft.add_argument("--mix_bigram", type=float, default=0.35, help="Mix ratio for updating bigram transitions (0..1)")
-    p_ft.add_argument("--mix_vectors", type=float, default=0.35, help="Mix ratio for updating semantic vectors (0..1)")
-    p_ft.add_argument("--corruption_swaps", type=int, default=2, help="Strength of structural corruption used to derive incoherence signals")
-    p_ft.add_argument("--corruption_quantile", type=float, default=0.995, help="Quantile for selecting corrupted-heavy transitions (0.5..0.9999)")
-    p_ft.add_argument("--seed", type=int, default=7)
-    p_ft.set_defaults(func=cmd_finetune)
 
     p_ge = sub.add_parser("generate")
     p_ge.add_argument("--artifacts", required=True)
