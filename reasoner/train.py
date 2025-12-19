@@ -36,7 +36,12 @@ def _kmeans(X: np.ndarray, k: int, iters: int = 25, seed: int = 7) -> np.ndarray
     n, k = X.shape[0], max(2, min(int(k), X.shape[0]))
     centroids = X[rng.choice(n, size=k, replace=False)].copy()
     for _ in range(iters):
-        labels = np.argmax(X @ centroids.T, axis=1).astype(np.int32)
+        X_safe = np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
+        centroids_safe = np.nan_to_num(centroids, nan=0.0, posinf=1e6, neginf=-1e6)
+        X_norm = X_safe / (np.linalg.norm(X_safe, axis=1, keepdims=True) + 1e-12)
+        centroids_norm = centroids_safe / (np.linalg.norm(centroids_safe, axis=1, keepdims=True) + 1e-12)
+        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+            labels = np.argmax(np.clip(X_norm @ centroids_norm.T, -1.0, 1.0), axis=1).astype(np.int32)
         new_centroids = np.zeros_like(centroids)
         for ci in range(k):
             mask = labels == ci
@@ -95,7 +100,11 @@ def build_neighbors(seqs: List[List[int]], vocab: List[str], topn: int = 5) -> D
 def build_contradictions(vectors: np.ndarray, cooc_threshold: float, cooc: np.ndarray,
                         vocab: List[str], roles: Dict[str, str], sim_threshold: float = 0.55,
                         max_pairs: int = 300) -> List[Dict[str, Any]]:
-    V, pairs, sims = len(vocab), [], vectors @ vectors.T
+    V, pairs = len(vocab), []
+    vectors_safe = np.nan_to_num(vectors, nan=0.0, posinf=1e6, neginf=-1e6)
+    vectors_norm = vectors_safe / (np.linalg.norm(vectors_safe, axis=1, keepdims=True) + 1e-12)
+    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+        sims = np.clip(vectors_norm @ vectors_norm.T, -1.0, 1.0)
     for i in range(V):
         for j in range(i + 1, V):
             if sims[i, j] >= sim_threshold and cooc[i, j] <= cooc_threshold and cooc[j, i] <= cooc_threshold:
