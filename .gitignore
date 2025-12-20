@@ -41,3 +41,7 @@ Thumbs.db
 *.log
 *.tmp
 
+# Artifacts (trained models - too large for git)
+artifacts/
+*.npz
+
