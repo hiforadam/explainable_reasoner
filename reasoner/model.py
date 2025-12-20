@@ -105,44 +105,6 @@ class ReasonerArtifacts:
             discourse_role_min_run=meta.get("discourse_role_min_run", []),
         )
 
-@dataclass
-class CriticArtifacts:
-    """Lightweight outcome critic trained self-supervised (real continuation vs corrupted/negative).
-
-    Stores a small linear model over hand-crafted features computed from ReasonerArtifacts.
-    """
-    vocab: List[str]
-    token_to_id: Dict[str, int]
-    weights: List[float]
-    bias: float = 0.0
-    meta: Dict[str, Any] = field(default_factory=dict)
-
-    def save(self, folder: str) -> None:
-        import os
-        os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, "critic.json")
-        payload = {
-            "vocab": self.vocab,
-            "weights": [float(x) for x in (self.weights or [])],
-            "bias": float(self.bias),
-            "meta": self.meta or {},
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-
-    @classmethod
-    def load(cls, folder: str) -> "CriticArtifacts":
-        import os
-        path = os.path.join(folder, "critic.json")
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        vocab = payload.get("vocab", [])
-        token_to_id = {t: i for i, t in enumerate(vocab)}
-        return cls(
-            vocab=vocab,
-            token_to_id=token_to_id,
-            weights=[float(x) for x in payload.get("weights", [])],
-            bias=float(payload.get("bias", 0.0)),
-            meta=payload.get("meta", {}) or {},
-        )
+# Removed: CriticArtifacts and ControllerArtifacts - no longer needed
+# Using rule-based quality scoring instead of trained models
 

@@ -5,8 +5,8 @@ from typing import Dict, Any
 
 from reasoner.data import load_examples, load_token_descriptions, write_jsonl
 from reasoner.tokenizer import ClosedVocabTokenizer
-from reasoner.train import train_reasoner, train_dual
-from reasoner.model import ReasonerArtifacts, CriticArtifacts
+from reasoner.train import train_reasoner, train_dual, train_triple
+from reasoner.model import ReasonerArtifacts
 from reasoner.selector import SelectorArtifacts
 from reasoner.generate import generate, generate_dual
 
@@ -39,7 +39,7 @@ def cmd_train_dual(args):
     ex = load_examples(args.data)
     texts = [t for _, t in ex]
     token_desc = load_token_descriptions(args.token_desc) if args.token_desc else {}
-    reasoner, selector, critic, metrics = train_dual(
+    reasoner, selector, metrics = train_dual(
         texts=texts,
         token_desc=token_desc,
         dim=args.dim,
@@ -50,10 +50,31 @@ def cmd_train_dual(args):
     )
     reasoner.save(args.artifacts)
     selector.save(args.artifacts)
-    critic.save(args.artifacts)
     print(f"[train-dual] reasoner vocab={len(reasoner.vocab)} dim={reasoner.vectors.shape[1]} saved to {args.artifacts}")
     print(f"[train-dual] selector contexts={len(selector.trigram_logp)} (trigram) + {len(selector.bigram_logp)} (bigram) saved to {args.artifacts}")
-    print(f"[train-dual] critic saved to {args.artifacts} (loss={metrics.get('critic_loss', 0.0):.4f})")
+
+
+def cmd_train_triple(args):
+    ex = load_examples(args.data)
+    texts = [t for _, t in ex]
+    token_desc = load_token_descriptions(args.token_desc) if args.token_desc else {}
+    # Simplified: train only reasoner + selector (no critic/controller needed)
+    reasoner, selector, metrics = train_triple(
+        texts=texts,
+        token_desc=token_desc,
+        dim=args.dim,
+        window=args.window,
+        desc_alpha=args.desc_alpha,
+        selector_smooth=args.selector_smooth,
+        selector_max_per_context=args.selector_max_per_context,
+    )
+    reasoner.save(args.artifacts)
+    selector.save(args.artifacts)
+    print(f"[train-triple] reasoner vocab={len(reasoner.vocab)} dim={reasoner.vectors.shape[1]} saved to {args.artifacts}")
+    print(f"[train-triple] selector contexts={len(selector.trigram_logp)} (trigram) + {len(selector.bigram_logp)} (bigram) saved to {args.artifacts}")
+
+
+# Removed: cmd_train_controller - no longer needed (using rule-based quality scoring)
 
 
 def cmd_generate(args):
@@ -71,20 +92,8 @@ def cmd_generate(args):
         semantic_repeat_window=args.semantic_repeat_window,
         semantic_repeat_threshold=args.semantic_repeat_threshold,
         semantic_repeat_penalty=args.semantic_repeat_penalty,
-        style=args.style,
-        min_sentence_tokens=args.min_sentence_tokens,
-        max_sentence_tokens=args.max_sentence_tokens,
-        closure_strength=args.closure_strength,
-        cluster_switch_window=args.cluster_switch_window,
-        cluster_switch_penalty=args.cluster_switch_penalty,
     )
     print(out["text"])
-    if out.get("gate") is not None:
-        gate = out.get("gate")
-        prof = (gate.get("contradiction_profile") or {})
-        print("\n--- REASONING GATE ---")
-        print(json.dumps({"coverage_score": gate.get("coverage_score"), "veto": prof.get("veto"), "veto_reasons": prof.get("veto_reasons"), "attempt": gate.get("attempt")}, ensure_ascii=False, indent=2))
-
     if args.explain:
         print("\n--- EXPLANATION (top candidates per step) ---")
         print(json.dumps(out["explain"], ensure_ascii=False, indent=2))
@@ -118,12 +127,42 @@ def cmd_generate_dual(args):
         num_continuations=args.num_continuations,
         commit_len=args.commit_len,
         w_meta_frame=args.w_meta_frame,
-        refine_rounds=args.refine_rounds,
-        max_attempts=args.max_attempts,
-        seed=args.seed,
-        candidate_temperature=args.candidate_temperature,
-        final_temperature=args.final_temperature,
+    )
+    print(out["text"])
+    if args.explain:
+        print("\n--- DEBATE TRACE (top continuations per step) ---")
+        print(json.dumps(out.get("explain", []), ensure_ascii=False, indent=2))
+        print("\n--- ONLINE STATE ---")
+        print(json.dumps(out.get("online", {}), ensure_ascii=False, indent=2))
 
+
+def cmd_generate_triple(args):
+    reasoner = ReasonerArtifacts.load(args.artifacts)
+    selector = SelectorArtifacts.load(args.artifacts)
+    out = generate_dual(
+        reasoner=reasoner,
+        selector=selector,
+        prompt=args.prompt,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        selector_top_k=args.selector_top_k,
+        alpha_selector=args.alpha_selector,
+        beta_reasoner=args.beta_reasoner,
+        eta_trust=args.eta_trust,
+        eta_bias=args.eta_bias,
+        trust_clip=args.trust_clip,
+        w_semantic=args.w_semantic,
+        w_anchor=args.w_anchor,
+        w_contra=args.w_contra,
+        w_repeat=args.w_repeat,
+        repeat_window=args.repeat_window,
+        block_dataset_meta=bool(args.block_dataset_meta),
+        explain=bool(args.explain),
+        context_window=args.context_window,
+        lookahead_len=args.lookahead_len,
+        num_continuations=args.num_continuations,
+        commit_len=args.commit_len,
+        w_meta_frame=args.w_meta_frame,
     )
     print(out["text"])
     if args.explain:
@@ -154,77 +193,102 @@ def main():
     p_tr.add_argument("--data", required=True)
     p_tr.add_argument("--token_desc", required=False, default="")
     p_tr.add_argument("--artifacts", required=True)
-    p_tr.add_argument("--dim", type=int, default=32)
-    p_tr.add_argument("--window", type=int, default=2)
-    p_tr.add_argument("--desc_alpha", type=float, default=0.35)
+    p_tr.add_argument("--dim", type=int, default=128)
+    p_tr.add_argument("--window", type=int, default=5)
+    p_tr.add_argument("--desc_alpha", type=float, default=0.40)
     p_tr.set_defaults(func=cmd_train)
 
     p_td = sub.add_parser("train-dual")
     p_td.add_argument("--data", required=True)
     p_td.add_argument("--token_desc", required=False, default="")
     p_td.add_argument("--artifacts", required=True)
-    p_td.add_argument("--dim", type=int, default=32)
-    p_td.add_argument("--window", type=int, default=2)
-    p_td.add_argument("--desc_alpha", type=float, default=0.35)
+    p_td.add_argument("--dim", type=int, default=128)
+    p_td.add_argument("--window", type=int, default=5)
+    p_td.add_argument("--desc_alpha", type=float, default=0.40)
     p_td.add_argument("--selector_smooth", type=float, default=0.5)
     p_td.add_argument("--selector_max_per_context", type=int, default=256)
     p_td.set_defaults(func=cmd_train_dual)
+
+    p_tt = sub.add_parser("train-triple")
+    p_tt.add_argument("--data", required=True)
+    p_tt.add_argument("--token_desc", required=False, default="")
+    p_tt.add_argument("--artifacts", required=True)
+    p_tt.add_argument("--dim", type=int, default=128)
+    p_tt.add_argument("--window", type=int, default=5)
+    p_tt.add_argument("--desc_alpha", type=float, default=0.40)
+    p_tt.add_argument("--selector_smooth", type=float, default=0.5)
+    p_tt.add_argument("--selector_max_per_context", type=int, default=256)
+    # Note: critic/controller removed - using rule-based quality scoring instead
+    p_tt.set_defaults(func=cmd_train_triple)
+
+# Removed: train-controller command - no longer needed
 
     p_ge = sub.add_parser("generate")
     p_ge.add_argument("--artifacts", required=True)
     p_ge.add_argument("--prompt", required=True)
     p_ge.add_argument("--max_new_tokens", type=int, default=30)
-    p_ge.add_argument("--temperature", type=float, default=0.8)
-    p_ge.add_argument("--top_k", type=int, default=8)
+    p_ge.add_argument("--temperature", type=float, default=0.70)
+    p_ge.add_argument("--top_k", type=int, default=12)
     p_ge.add_argument("--explain", type=int, default=0)
-    p_ge.add_argument("--block_dataset_meta", type=int, default=1, help="Block dataset/meta tokens from output (1=yes, 0=no)")
-    p_ge.add_argument("--repeat_window", type=int, default=3, help="Window size for exact repetition penalty")
-    p_ge.add_argument("--repetition_penalty", type=float, default=1.25, help="Penalty strength for exact token repetition")
-    p_ge.add_argument("--semantic_repeat_window", type=int, default=2, help="Window size for semantic repetition penalty")
-    p_ge.add_argument("--semantic_repeat_threshold", type=float, default=0.72, help="Cosine threshold above which semantic repetition is penalized")
-    p_ge.add_argument("--semantic_repeat_penalty", type=float, default=0.85, help="Penalty strength for semantic repetition")
-    p_ge.add_argument("--style", choices=["descriptive", "explanatory"], default="descriptive")
-    p_ge.add_argument("--min_sentence_tokens", type=int, default=10)
-    p_ge.add_argument("--max_sentence_tokens", type=int, default=26)
-    p_ge.add_argument("--closure_strength", type=float, default=1.15)
-    p_ge.add_argument("--cluster_switch_window", type=int, default=2)
-    p_ge.add_argument("--cluster_switch_penalty", type=float, default=0.28)
+    p_ge.add_argument("--block_dataset_meta", type=int, default=1)
+    p_ge.add_argument("--repeat_window", type=int, default=12)
+    p_ge.add_argument("--repetition_penalty", type=float, default=2.25)
+    p_ge.add_argument("--semantic_repeat_window", type=int, default=6)
+    p_ge.add_argument("--semantic_repeat_threshold", type=float, default=0.68)
+    p_ge.add_argument("--semantic_repeat_penalty", type=float, default=1.15)
     p_ge.set_defaults(func=cmd_generate)
 
     p_gd = sub.add_parser("generate-dual")
     p_gd.add_argument("--artifacts", required=True)
     p_gd.add_argument("--prompt", required=True)
     p_gd.add_argument("--max_new_tokens", type=int, default=60)
-    p_gd.add_argument("--temperature", type=float, default=0.85)
-    p_gd.add_argument("--selector_top_k", type=int, default=32)
-    p_gd.add_argument("--alpha_selector", type=float, default=0.55)
-    p_gd.add_argument("--beta_reasoner", type=float, default=0.45)
+    p_gd.add_argument("--temperature", type=float, default=0.70)
+    p_gd.add_argument("--selector_top_k", type=int, default=40)
+    p_gd.add_argument("--alpha_selector", type=float, default=0.45)
+    p_gd.add_argument("--beta_reasoner", type=float, default=0.55)
     p_gd.add_argument("--eta_trust", type=float, default=0.10)
     p_gd.add_argument("--eta_bias", type=float, default=0.08)
     p_gd.add_argument("--trust_clip", type=float, default=2.0)
-    p_gd.add_argument("--w_semantic", type=float, default=1.0)
-    p_gd.add_argument("--w_anchor", type=float, default=0.55)
-    p_gd.add_argument("--w_contra", type=float, default=1.25)
-    p_gd.add_argument("--w_repeat", type=float, default=0.85)
+    p_gd.add_argument("--w_semantic", type=float, default=1.25)
+    p_gd.add_argument("--w_anchor", type=float, default=0.85)
+    p_gd.add_argument("--w_contra", type=float, default=1.45)
+    p_gd.add_argument("--w_repeat", type=float, default=1.35)
     p_gd.add_argument("--repeat_window", type=int, default=6)
     p_gd.add_argument("--context_window", type=int, default=10)
     p_gd.add_argument("--block_dataset_meta", type=int, default=1)
     p_gd.add_argument("--explain", type=int, default=0)
 
-    # NEW: micro-continuation debate controls
-    p_gd.add_argument("--lookahead_len", type=int, default=6, help="Continuation length used for sequence-level debate")
-    p_gd.add_argument("--num_continuations", type=int, default=12, help="How many continuations to sample per step")
-    p_gd.add_argument("--commit_len", type=int, default=1, help="How many tokens to commit from the chosen continuation per step")
-    p_gd.add_argument("--w_meta_frame", type=float, default=0.45, help="Penalty weight for meta framing roles at the continuation level")
-
-    # Deprecated: Reasoning Gate parameters (kept for compatibility, but disabled for performance)
-    p_gd.add_argument("--refine_rounds", type=int, default=0, help="[DEPRECATED] Disabled for performance. Use 0.")
-    p_gd.add_argument("--max_attempts", type=int, default=1, help="[DEPRECATED] Disabled for performance. Use 1.")
-    p_gd.add_argument("--seed", type=int, default=None, help="[DEPRECATED] RNG seed (optional).")
-    p_gd.add_argument("--candidate_temperature", type=float, default=None, help="[DEPRECATED] Not used.")
-    p_gd.add_argument("--final_temperature", type=float, default=None, help="[DEPRECATED] Not used.")
+    p_gd.add_argument("--lookahead_len", type=int, default=10)
+    p_gd.add_argument("--num_continuations", type=int, default=18)
+    p_gd.add_argument("--commit_len", type=int, default=1)
+    p_gd.add_argument("--w_meta_frame", type=float, default=0.45)
 
     p_gd.set_defaults(func=cmd_generate_dual)
+
+    p_gt = sub.add_parser("generate-triple")
+    p_gt.add_argument("--artifacts", required=True)
+    p_gt.add_argument("--prompt", required=True)
+    p_gt.add_argument("--max_new_tokens", type=int, default=60)
+    p_gt.add_argument("--temperature", type=float, default=0.85)
+    p_gt.add_argument("--selector_top_k", type=int, default=32)
+    p_gt.add_argument("--alpha_selector", type=float, default=0.55)
+    p_gt.add_argument("--beta_reasoner", type=float, default=0.45)
+    p_gt.add_argument("--eta_trust", type=float, default=0.10)
+    p_gt.add_argument("--eta_bias", type=float, default=0.08)
+    p_gt.add_argument("--trust_clip", type=float, default=2.0)
+    p_gt.add_argument("--w_semantic", type=float, default=1.0)
+    p_gt.add_argument("--w_anchor", type=float, default=0.55)
+    p_gt.add_argument("--w_contra", type=float, default=1.25)
+    p_gt.add_argument("--w_repeat", type=float, default=0.85)
+    p_gt.add_argument("--repeat_window", type=int, default=6)
+    p_gt.add_argument("--context_window", type=int, default=10)
+    p_gt.add_argument("--block_dataset_meta", type=int, default=1)
+    p_gt.add_argument("--explain", type=int, default=0)
+    p_gt.add_argument("--lookahead_len", type=int, default=6)
+    p_gt.add_argument("--num_continuations", type=int, default=12)
+    p_gt.add_argument("--commit_len", type=int, default=1)
+    p_gt.add_argument("--w_meta_frame", type=float, default=0.45)
+    p_gt.set_defaults(func=cmd_generate_triple)
 
     p_v = sub.add_parser("vocab")
     p_v.add_argument("--data", required=True)

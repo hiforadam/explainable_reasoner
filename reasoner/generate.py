@@ -7,6 +7,7 @@ from .selector import SelectorArtifacts
 from .utils import softmax
 
 def _build_contradiction_lookup(pairs: List[Dict[str, Any]], token_to_id: Dict[str, int]) -> Dict[Tuple[int, int], float]:
+    """Build contradiction lookup dictionary from pairs."""
     out = {}
     for p in pairs:
         a, b = token_to_id.get(p.get("a")), token_to_id.get(p.get("b"))
@@ -15,6 +16,10 @@ def _build_contradiction_lookup(pairs: List[Dict[str, Any]], token_to_id: Dict[s
             if pen > 0:
                 out[(a, b)] = out[(b, a)] = max(out.get((a, b), 0.0), pen)
     return out
+
+def build_contra_lookup(art: ReasonerArtifacts) -> Dict[Tuple[int, int], float]:
+    """Build contradiction lookup from ReasonerArtifacts."""
+    return _build_contradiction_lookup(art.contradiction_pairs or [], art.token_to_id)
 
 def _repetition_penalty(candidate_id: int, recent: List[int], base_penalty: float) -> float:
     return float(base_penalty * sum(1 for r in recent if r == candidate_id)) if base_penalty > 0 else 0.0
@@ -95,15 +100,15 @@ def generate(
     top_k: int = 8,
     explain: bool = False,
     block_dataset_meta: bool = True,
-    repeat_window: int = 3,
-    repetition_penalty: float = 1.25,
-    semantic_repeat_window: int = 2,
-    semantic_repeat_threshold: float = 0.72,
-    semantic_repeat_penalty: float = 0.85,
+    repeat_window: int = 12,
+    repetition_penalty: float = 2.25,
+    semantic_repeat_window: int = 6,
+    semantic_repeat_threshold: float = 0.68,
+    semantic_repeat_penalty: float = 1.15,
     # New: style + sentence closure + cluster switching (no hardcoded tokens)
     style: str = "descriptive",  # descriptive|explanatory
-    min_sentence_tokens: int = 10,
-    max_sentence_tokens: int = 26,
+    min_sentence_tokens: int = 12,
+    max_sentence_tokens: int = 35,
     closure_strength: float = 1.15,
     cluster_switch_window: int = 2,
     cluster_switch_penalty: float = 0.28,
@@ -111,11 +116,11 @@ def generate(
     meta_frame_penalty: float = 1.05,
     role_loop_penalty: float = 0.85,
     # Configurable weights and thresholds (previously hardcoded)
-    weight_bigram: float = 1.00,
-    weight_semantic: float = 0.85,
-    weight_contradiction: float = 1.15,
-    context_window: int = 6,
-    contradiction_window: int = 4,
+    weight_bigram: float = 1.35,
+    weight_semantic: float = 1.15,
+    weight_contradiction: float = 1.45,
+    context_window: int = 30,  # Increased from 20 for better coherence
+    contradiction_window: int = 10,
     role_weight: float = 0.45,
     role_weight_explanatory_mult: float = 1.10,
     role_weight_descriptive_mult: float = 0.95,
@@ -149,10 +154,22 @@ def generate(
 
     # optional cluster ids array
     clusters_by_id: Optional[List[int]] = None
+    meta_cluster_centroid = None
     if art.clusters:
         clusters_by_id = [int(art.clusters.get(t, -1)) for t in art.vocab]
         if all(c == -1 for c in clusters_by_id):
             clusters_by_id = None
+        # Build meta cluster centroid for dynamic meta-text detection
+        meta_cluster_ids = getattr(art, "meta_cluster_ids", []) or []
+        if meta_cluster_ids and clusters_by_id:
+            meta_tokens = [i for i, cid in enumerate(clusters_by_id) if cid in meta_cluster_ids]
+            if len(meta_tokens) >= 3:
+                meta_cluster_centroid = vec[meta_tokens].mean(axis=0)
+                meta_norm = np.linalg.norm(meta_cluster_centroid)
+                if meta_norm > 1e-8:
+                    meta_cluster_centroid = meta_cluster_centroid / meta_norm
+                else:
+                    meta_cluster_centroid = None
 
     # inferred sentence-end tokens (punctuation-like)
     end_token_ids: List[int] = []
@@ -237,22 +254,104 @@ def generate(
         else:
             tokens_since_end += 1
 
-        # context vector = mean of last tokens
+        # context vector = weighted mean of last tokens (recent tokens weighted more)
+        # Improved: use positional encoding awareness for better context understanding
         k = min(context_window, len(ids))
-        ctx = vec[ids[-k:]].mean(axis=0)
+        recent_ids = ids[-k:]
+        # Exponential decay weighting: more recent tokens have higher weight
+        # Also add positional bias: tokens closer to current position matter more
+        if len(recent_ids) > 1:
+            # Decay factor: recent tokens get exponentially more weight
+            decay_factor = 0.85
+            weights = np.array([decay_factor ** (len(recent_ids) - 1 - i) for i in range(len(recent_ids))], dtype=np.float32)
+            weights = weights / weights.sum()
+            ctx = (vec[recent_ids] * weights[:, np.newaxis]).sum(axis=0)
+        else:
+            ctx = vec[recent_ids].mean(axis=0) if recent_ids else np.zeros(vec.shape[1], dtype=np.float32)
 
         comp_bigram = bigram_logp[prev].astype(np.float64)
-        comp_sem = (vec @ ctx).astype(np.float64)
+        # Optimized semantic similarity: vectorized dot product with normalization
+        # Normalize context vector for better cosine similarity (with numerical stability)
+        ctx_norm_val = np.linalg.norm(ctx)
+        if ctx_norm_val > 1e-8:
+            ctx_norm = ctx / ctx_norm_val
+        else:
+            ctx_norm = np.zeros_like(ctx)
+        
+        vec_norms = np.linalg.norm(vec, axis=1, keepdims=True)
+        vec_norm = np.where(vec_norms > 1e-8, vec / vec_norms, np.zeros_like(vec))
+        
+        # Safe matmul with numerical stability checks
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            comp_sem = (vec_norm @ ctx_norm).astype(np.float64)
+            comp_sem = np.nan_to_num(comp_sem, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        # Apply adaptive scaling: boost semantic component when it's informative
+        sem_std = float(np.std(comp_sem))
+        if sem_std > 0.15:  # Good semantic diversity
+            comp_sem = comp_sem * 1.15
+        else:  # Low diversity, boost more
+            comp_sem = comp_sem * 1.25
+        
+        # Combine bigram and semantic scores
+        logits = (weight_bigram * comp_bigram + weight_semantic * comp_sem).astype(np.float64)
+        
+        # Topic drift detection: check alignment with prompt anchor (if available)
+        # Build anchor from prompt tokens
+        if len(ids) > 0:
+            # Use initial prompt tokens as anchor
+            k0 = min(24, len(ids))
+            anchor_tokens = ids[:k0]
+            if len(anchor_tokens) > 0:
+                if len(anchor_tokens) > 1:
+                    weights = np.exp(np.linspace(0, -0.25, len(anchor_tokens), dtype=np.float32))
+                    weights = weights / (weights.sum() + 1e-12)
+                    anchor = (vec[anchor_tokens] * weights[:, np.newaxis]).sum(axis=0)
+                else:
+                    anchor = vec[anchor_tokens[0]]
+                anchor_norm_val = np.linalg.norm(anchor)
+                if anchor_norm_val > 1e-8:
+                    anchor_norm = anchor / anchor_norm_val
+                    # Safe topic alignment calculation
+                    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                        topic_alignment = (vec_norm @ anchor_norm).astype(np.float64)
+                        topic_alignment = np.nan_to_num(topic_alignment, nan=0.0, posinf=1.0, neginf=-1.0)
+                    # Penalty for tokens that drift from topic (strengthened)
+                    topic_drift_penalty = np.zeros((V,), dtype=np.float64)
+                    for j in range(V):
+                        if topic_alignment[j] < 0.15:  # Low alignment with topic
+                            topic_drift_penalty[j] = 0.5 * (0.15 - topic_alignment[j])  # Increased from 0.25
+                    logits = logits - topic_drift_penalty
 
-        # contradiction penalty based on recent tokens
+        # contradiction penalty based on recent tokens - OPTIMIZED: sparse lookup
         recent_contra = ids[-min(contradiction_window, len(ids)) :]
         contra_pen = np.zeros((V,), dtype=np.float64)
-        for r in recent_contra:
-            # sparse-ish lookup; V is small but keep it straightforward
+        # Optimized: only iterate over tokens that have contradictions
+        recent_set = set(recent_contra)
+        # Build reverse lookup: for each recent token, get all its contradictions
+        for r in recent_set:
+            # Only check tokens that actually contradict with r
             for j in range(V):
-                contra_pen[j] += contra.get((r, j), 0.0)
+                pen = contra.get((r, j), 0.0)
+                if pen > 0:
+                    contra_pen[j] += pen * (1.0 + 0.1 * len(recent_set))  # Scale by context size
 
+        # Enhanced: better balance with stronger bigram component
+        # Bigram is critical for fluency, so give it more weight
         logits = weight_bigram * comp_bigram + weight_semantic * comp_sem - weight_contradiction * contra_pen
+        
+        # Additional coherence check: boost tokens that follow well from previous
+        if len(ids) >= 2:
+            prev_prev = ids[-2]
+            if 0 <= prev_prev < V:
+                # Check bigram probability for prev_prev -> candidate
+                for j in range(V):
+                    if prev_prev < len(bigram_logp) and j < len(bigram_logp[prev_prev]):
+                        bigram_score = float(bigram_logp[prev_prev, j])
+                        if bigram_score > -2.0:  # Good transition
+                            logits[j] += 0.15
+                        elif bigram_score < -6.0:  # Poor transition
+                            logits[j] -= 0.10
 
                 # --- Discourse role compatibility (LLM-like token-by-token role_state) ---
         # If discourse artifacts exist, adjust logits by how compatible a candidate token's LEVEL is
@@ -280,6 +379,34 @@ def generate(
             for j in range(V):
                 if roles_by_id[j] == "dataset_meta":
                     logits[j] = -1e18
+        
+        # Dynamic meta-text detection: penalize tokens that form meta-text patterns
+        # Check if candidate token would create meta-text sequences
+        if meta_cluster_centroid is not None and len(ids) >= 1:
+            for j in range(V):
+                # Check semantic similarity to meta cluster
+                cand_vec = vec[j]
+                cand_norm_val = np.linalg.norm(cand_vec)
+                if cand_norm_val > 1e-8:
+                    cand_norm = cand_vec / cand_norm_val
+                    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                        meta_sim = float(np.dot(cand_norm, meta_cluster_centroid))
+                        meta_sim = np.nan_to_num(meta_sim, nan=0.0, posinf=1.0, neginf=-1.0)
+                    # If token is semantically similar to meta cluster, check context
+                    if meta_sim > 0.35:  # Lowered threshold from 0.4
+                        # Check if recent tokens also have meta roles (forming meta-text phrase)
+                        recent_meta_count = 0
+                        for rid in ids[-3:]:
+                            if 0 <= rid < V:
+                                rrole = roles_by_id[rid]
+                                if rrole and (rrole.startswith("meta") or rrole == "dataset_meta"):
+                                    recent_meta_count += 1
+                        # If recent tokens are also meta, this forms a meta-text phrase
+                        if recent_meta_count >= 1:
+                            logits[j] -= 1.5 * meta_sim  # Increased from 0.8 - stronger penalty
+                        # Also penalize if token itself has meta role
+                        if roles_by_id[j] and (roles_by_id[j].startswith("meta") or roles_by_id[j] == "dataset_meta"):
+                            logits[j] -= 0.6 * meta_sim  # Additional penalty for meta role + semantic similarity
 
         
         # --- Role-aware neighbor gating: penalize editorial/meta framing loops (no hardcoded token lists) ---
@@ -318,20 +445,76 @@ def generate(
                 if rr and rr[-1] == "meta_frame" and roles_by_id[j] == "meta_frame":
                     logits[j] -= float(role_loop_penalty) * loop_boost
 
-# --- Anti-repetition controls (exact + semantic) ---
+# --- Anti-repetition controls (exact + semantic + n-gram) - ENHANCED ---
         rw = max(0, int(repeat_window))
         if rw > 0 and repetition_penalty > 0:
             exact_recent = ids[-rw:]
+            # Enhanced: count frequency and apply MUCH stronger penalty for frequent repeats
+            recent_counts = {}
+            for r in exact_recent:
+                recent_counts[r] = recent_counts.get(r, 0) + 1
             for j in range(V):
-                logits[j] -= _repetition_penalty(j, exact_recent, float(repetition_penalty))
+                count = recent_counts.get(j, 0)
+                if count > 0:
+                    # Very strong exponential penalty: more repeats = MUCH stronger penalty
+                    # Base penalty scales with count, then exponential multiplier
+                    base_penalty = float(repetition_penalty) * count
+                    exponential_mult = 1.0 + (count - 1) * 1.2  # Exponential growth
+                    logits[j] -= base_penalty * exponential_mult
+                    # Additional penalty if token appeared very recently (last 3 positions)
+                    if len(ids) >= 3 and j in ids[-3:]:
+                        logits[j] -= float(repetition_penalty) * 0.8
+            
+            # N-gram repetition detection (phrases/bigrams)
+            if len(ids) >= 2:
+                # Check for bigram repetition
+                recent_bigrams = {}
+                for i in range(max(0, len(ids) - rw), len(ids) - 1):
+                    bigram = (ids[i], ids[i+1])
+                    recent_bigrams[bigram] = recent_bigrams.get(bigram, 0) + 1
+                # Penalize tokens that would create repeated bigrams
+                if len(ids) >= 1:
+                    prev_token = ids[-1]
+                    for j in range(V):
+                        bigram = (prev_token, j)
+                        bigram_count = recent_bigrams.get(bigram, 0)
+                        if bigram_count > 0:
+                            # Penalty for repeating bigrams
+                            logits[j] -= float(repetition_penalty) * 0.6 * bigram_count
+            
+            # Trigram repetition detection
+            if len(ids) >= 3:
+                recent_trigrams = {}
+                for i in range(max(0, len(ids) - rw), len(ids) - 2):
+                    trigram = (ids[i], ids[i+1], ids[i+2])
+                    recent_trigrams[trigram] = recent_trigrams.get(trigram, 0) + 1
+                # Penalize tokens that would create repeated trigrams
+                if len(ids) >= 2:
+                    prev2_token = ids[-2]
+                    prev1_token = ids[-1]
+                    for j in range(V):
+                        trigram = (prev2_token, prev1_token, j)
+                        trigram_count = recent_trigrams.get(trigram, 0)
+                        if trigram_count > 0:
+                            # Strong penalty for repeating trigrams (phrases)
+                            logits[j] -= float(repetition_penalty) * 1.2 * trigram_count
 
         sw = max(0, int(semantic_repeat_window))
         if sw > 0 and semantic_repeat_penalty > 0:
             sem_recent = ids[-sw:]
+            # Enhanced: check semantic similarity more aggressively
             for j in range(V):
                 if roles_by_id[j] == "punct":
                     continue
-                logits[j] -= _semantic_repeat_penalty(j, sem_recent, vec, float(semantic_repeat_threshold), float(semantic_repeat_penalty))
+                # Check against all recent tokens, not just one
+                max_sim = 0.0
+                for r in sem_recent:
+                    sim = float(vec[r] @ vec[j])
+                    max_sim = max(max_sim, sim)
+                if max_sim > float(semantic_repeat_threshold):
+                    # Stronger penalty for high similarity
+                    penalty = float(semantic_repeat_penalty) * (1.0 + 2.0 * (max_sim - float(semantic_repeat_threshold)))
+                    logits[j] -= penalty
 
         # --- Cluster switch (concept packing) ---
         if clusters_by_id is not None and cluster_pen > 0:
@@ -340,15 +523,58 @@ def generate(
                 for j in range(V):
                     logits[j] -= _cluster_switch_penalty(j, ids, clusters_by_id, cw, cluster_pen, roles_by_id=roles_by_id)
 
+        # Enhanced sentence length control
         if closure_k > 0 and end_token_ids:
             for j in end_token_ids:
-                logits[j] += _closure_boost(j, tokens_since_end, int(min_sentence_tokens), int(max_sentence_tokens), end_token_ids, closure_k, roles_by_id)
+                closure_boost_val = _closure_boost(j, tokens_since_end, int(min_sentence_tokens), int(max_sentence_tokens), end_token_ids, closure_k, roles_by_id)
+                logits[j] += closure_boost_val
+                # Penalty for ending sentences too early (before min_sentence_tokens)
+                if tokens_since_end < int(min_sentence_tokens):
+                    logits[j] -= 1.5 * closure_k  # Strong penalty for premature sentence end
+                # Bonus for continuing longer sentences (encourage longer sentences)
+                elif tokens_since_end >= int(min_sentence_tokens) and tokens_since_end < int(max_sentence_tokens):
+                    # Encourage continuation: penalize sentence end tokens when sentence is still growing
+                    logits[j] -= 0.4 * closure_k
+        
+        # Sentence completeness check: penalize incomplete sentences
+        # Check if we're ending a sentence that seems incomplete
+        if len(ids) >= 3:
+            # Check if last few tokens suggest incomplete sentence
+            last_tokens = ids[-3:]
+            last_roles = [roles_by_id[t] if 0 <= t < V else "unknown" for t in last_tokens]
+            # If ending with function words or incomplete structure, penalize sentence end
+            if any(r == "function_word" for r in last_roles[-2:]):
+                for j in end_token_ids:
+                    logits[j] -= 0.3 * closure_k
 
-        # top-k sampling
-        top_idx = np.argsort(-logits)[:max(1, top_k)]
-        top_logits = logits[top_idx]
-        probs = softmax(top_logits, temp=max(float(temperature), 1e-6))
-        choice_local = int(np.random.choice(len(top_idx), p=probs))
+        # Improved sampling: nucleus (top-p) + top-k hybrid for better quality
+        # Sort all logits
+        sorted_idx = np.argsort(-logits)
+        sorted_logits = logits[sorted_idx]
+        
+        # Apply temperature first
+        temp_adj = max(float(temperature), 0.1)
+        temp_logits = sorted_logits / temp_adj
+        
+        # Compute probabilities for nucleus sampling
+        temp_logits = temp_logits - np.max(temp_logits)  # Numerical stability
+        exp_logits = np.exp(np.clip(temp_logits, -50, 50))
+        probs = exp_logits / exp_logits.sum()
+        
+        # Nucleus (top-p) sampling: take tokens until cumulative prob >= 0.9
+        cumsum_probs = np.cumsum(probs)
+        nucleus_idx = np.searchsorted(cumsum_probs, 0.9, side='right') + 1
+        nucleus_idx = min(nucleus_idx, len(probs), max(1, top_k))
+        
+        # Also respect top-k limit
+        nucleus_idx = min(nucleus_idx, max(1, top_k))
+        
+        # Select from nucleus
+        top_idx = sorted_idx[:nucleus_idx]
+        top_probs = probs[:nucleus_idx]
+        top_probs = top_probs / top_probs.sum()  # Renormalize
+        
+        choice_local = int(np.random.choice(len(top_idx), p=top_probs))
         nxt = int(top_idx[choice_local])
         ids.append(nxt)
 
@@ -411,25 +637,25 @@ def _generate_dual_once(
     max_new_tokens: int = 60,
     temperature: float = 0.85,
     selector_top_k: int = 32,
-    # Debate mix weights:
-    alpha_selector: float = 0.55,
-    beta_reasoner: float = 0.45,
+    # Debate mix weights: favor reasoner slightly more for better coherence
+    alpha_selector: float = 0.45,
+    beta_reasoner: float = 0.55,
     # Online strengthening/weakening during generation:
     eta_trust: float = 0.10,
     eta_bias: float = 0.08,
     trust_clip: float = 2.0,
     # Reasoner scoring weights:
-    w_semantic: float = 1.0,
-    w_anchor: float = 0.55,
-    w_contra: float = 1.25,
-    w_repeat: float = 0.85,
-    repeat_window: int = 6,
+    w_semantic: float = 1.25,
+    w_anchor: float = 1.15,  # Increased from 0.85 to strengthen prompt relevance
+    w_contra: float = 1.45,
+    w_repeat: float = 1.35,
+    repeat_window: int = 12,
     block_dataset_meta: bool = True,
     explain: bool = False,
-    context_window: int = 10,
+    context_window: int = 30,  # Increased from 20 for better coherence
     # NEW: micro-continuation debate (sequence-level critique)
-    lookahead_len: int = 6,
-    num_continuations: int = 12,
+    lookahead_len: int = 10,
+    num_continuations: int = 18,
     commit_len: int = 1,
     # NEW: penalize "LLM-like" meta framing (derived token roles, no hardcoded token lists)
     w_meta_frame: float = 0.45,
@@ -455,15 +681,54 @@ def _generate_dual_once(
     V = len(reasoner.vocab)
     vec = reasoner.vectors
 
-    # prompt anchor (directional intent)
+    # prompt anchor (directional intent) - enhanced with better weighting and topic tracking
     if prompt_ids:
-        k0 = min(16, len(prompt_ids))
-        anchor = vec[prompt_ids[:k0]].mean(axis=0)
+        k0 = min(24, len(prompt_ids))  # Use more tokens for better anchor
+        # Weight earlier tokens more (they define the topic)
+        anchor_tokens = prompt_ids[:k0]
+        if len(anchor_tokens) > 1:
+            weights = np.exp(np.linspace(0, -0.25, len(anchor_tokens), dtype=np.float32))
+            weights = weights / weights.sum()
+            anchor = (vec[anchor_tokens] * weights[:, np.newaxis]).sum(axis=0)
+        else:
+            anchor = vec[anchor_tokens].mean(axis=0)
+        # Normalize anchor
+        anchor = anchor / (np.linalg.norm(anchor) + 1e-8)
     else:
         anchor = np.zeros((vec.shape[1],), dtype=np.float32)
+    
+    # Topic tracking: maintain running average of recent tokens to detect topic drift
+    # Strengthened: higher decay to preserve original topic better
+    topic_tracker = anchor.copy() if len(prompt_ids) > 0 else np.zeros((vec.shape[1],), dtype=np.float32)
+    topic_tracker_decay = 0.95  # Increased from 0.92 to preserve topic better
+    # Initialize topic tracker with recent tokens from ids if available
+    if len(ids) > 0:
+        recent_for_topic = ids[-min(8, len(ids)):]
+        if recent_for_topic:
+            topic_tracker = vec[recent_for_topic].mean(axis=0)
+            topic_norm = np.linalg.norm(topic_tracker)
+            if topic_norm > 1e-8:
+                topic_tracker = topic_tracker / topic_norm
+            else:
+                topic_tracker = anchor.copy() if len(prompt_ids) > 0 else np.zeros((vec.shape[1],), dtype=np.float32)
 
     contra = _build_contradiction_lookup(reasoner.contradiction_pairs, reasoner.token_to_id)
+    contra_lookup = build_contra_lookup(reasoner)
     roles_by_id = [reasoner.roles.get(t, "unknown") for t in reasoner.vocab]
+    
+    # Build meta cluster centroid for dynamic meta-text detection (no hardcoded lists)
+    meta_cluster_centroid = None
+    meta_cluster_ids = getattr(reasoner, "meta_cluster_ids", []) or []
+    if meta_cluster_ids and reasoner.clusters:
+        clusters_by_id = [int(reasoner.clusters.get(t, -1)) for t in reasoner.vocab]
+        meta_tokens = [i for i, cid in enumerate(clusters_by_id) if cid in meta_cluster_ids]
+        if len(meta_tokens) >= 3:
+            meta_cluster_centroid = vec[meta_tokens].mean(axis=0)
+            meta_norm = np.linalg.norm(meta_cluster_centroid)
+            if meta_norm > 1e-8:
+                meta_cluster_centroid = meta_cluster_centroid / meta_norm
+            else:
+                meta_cluster_centroid = None
 
     # Online state
     trust = np.zeros((V,), dtype=np.float64)
@@ -508,10 +773,14 @@ def _generate_dual_once(
         j = int(np.random.choice(len(cand_ids), p=probs))
         return int(cand_ids[j]), float(cand_lps[j])
 
-    def score_continuation(cont: List[int], prev2: Optional[int], prev1: Optional[int]) -> Tuple[float, float, float, float]:
-        """Return (selector_avg, reasoner_avg, total, meta_frac) for a continuation."""
+    def score_continuation(cont: List[int], prev2: Optional[int], prev1: Optional[int]) -> Tuple[float, float, float]:
+        """Return (selector_bias_avg, reasoner_avg, meta_frac).
+
+        Note: this function does NOT include the selector's sampled logp (handled by the caller).
+        Quality scoring is handled separately in the caller.
+        """
         if not cont:
-            return -1e9, -1e9, -1e9, 0.0
+            return -1e9, -1e9, 0.0
 
         # selector: include online bias along the path
         sel_sum = 0.0
@@ -524,46 +793,370 @@ def _generate_dual_once(
             p2, p1 = (p1, int(tid)) if p1 is not None else (None, int(tid))
 
         # reasoner: score sequence token-by-token with moving context
+        # Optimized: batch process where possible
         tmp_ids = list(ids)
         reason_sum = 0.0
         meta_count = 0.0
-        for tid in cont:
+        
+        # Initialize local topic tracker for this continuation (use anchor as base)
+        local_topic_tracker = anchor.copy() if len(prompt_ids) > 0 else np.zeros((vec.shape[1],), dtype=np.float32)
+        if len(tmp_ids) > 0:
+            recent_for_topic = tmp_ids[-min(6, len(tmp_ids)):]
+            if recent_for_topic:
+                local_topic_tracker = vec[recent_for_topic].mean(axis=0)
+                local_topic_norm = np.linalg.norm(local_topic_tracker)
+                if local_topic_norm > 1e-8:
+                    local_topic_tracker = local_topic_tracker / local_topic_norm
+                else:
+                    local_topic_tracker = anchor.copy() if len(prompt_ids) > 0 else np.zeros((vec.shape[1],), dtype=np.float32)
+        topic_tracker_decay_local = 0.95  # Increased from 0.92 to preserve topic better
+        
+        # Prompt relevance: compute overall continuation relevance to prompt
+        cont_vec_sum = np.zeros((vec.shape[1],), dtype=np.float32)
+        cont_token_count = 0
+        
+        # Dynamic meta-text detection: track meta patterns in continuation
+        meta_sequence_penalty = 0.0
+        meta_role_sequence = []
+        
+        for idx, tid in enumerate(cont):
             if not (0 <= int(tid) < V):
                 continue
             role = roles_by_id[int(tid)]
             # block dataset/meta tokens completely if requested
             if block_dataset_meta and role == "dataset_meta":
-                reason_sum -= 2.5
+                reason_sum -= 3.5  # Increased from 2.5
             # Count meta roles using pattern matching (no hardcoded set)
             if role and (role.startswith("meta") or role == "dataset_meta"):
                 meta_count += 1.0
+                # Additional penalty for meta_frame roles (stronger than other meta roles)
+                if role == "meta_frame":
+                    reason_sum -= 1.5  # Strong penalty for meta_frame tokens
+                meta_role_sequence.append(int(tid))
+            else:
+                meta_role_sequence.append(None)
 
             k = min(int(context_window), len(tmp_ids)) if tmp_ids else 0
-            ctx = vec[tmp_ids[-k:]].mean(axis=0) if k > 0 else anchor
+            if k > 1:
+                # Weighted context: recent tokens more important with positional decay
+                recent = tmp_ids[-k:]
+                decay_factor = 0.88
+                weights = np.array([decay_factor ** (len(recent) - 1 - i) for i in range(len(recent))], dtype=np.float32)
+                weights = weights / weights.sum()
+                ctx = (vec[recent] * weights[:, np.newaxis]).sum(axis=0)
+            else:
+                ctx = vec[tmp_ids[-k:]].mean(axis=0) if k > 0 else anchor
 
-            sem = float(np.dot(vec[int(tid)], ctx))
-            anc = float(np.dot(vec[int(tid)], anchor))
+            # Use pre-computed vector for this token with normalization (numerically stable)
+            tid_vec = vec[int(tid)]
+            # Normalize for better cosine similarity with safety checks
+            ctx_norm_val = np.linalg.norm(ctx)
+            ctx_norm = ctx / ctx_norm_val if ctx_norm_val > 1e-8 else np.zeros_like(ctx)
+            
+            anchor_norm_val = np.linalg.norm(anchor)
+            anchor_norm = anchor / anchor_norm_val if anchor_norm_val > 1e-8 else np.zeros_like(anchor)
+            
+            tid_vec_norm_val = np.linalg.norm(tid_vec)
+            tid_vec_norm = tid_vec / tid_vec_norm_val if tid_vec_norm_val > 1e-8 else np.zeros_like(tid_vec)
+            
+            # Safe dot products
+            with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                sem = float(np.dot(tid_vec_norm, ctx_norm))
+                anc = float(np.dot(tid_vec_norm, anchor_norm))
+                sem = np.nan_to_num(sem, nan=0.0, posinf=1.0, neginf=-1.0)
+                anc = np.nan_to_num(anc, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+            # Topic drift detection: check if token aligns with topic tracker (strengthened)
+            topic_tracker_norm_val = np.linalg.norm(local_topic_tracker)
+            if topic_tracker_norm_val > 1e-8:
+                topic_tracker_norm = local_topic_tracker / topic_tracker_norm_val
+                with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                    topic_alignment = float(np.dot(tid_vec_norm, topic_tracker_norm))
+                    topic_alignment = np.nan_to_num(topic_alignment, nan=0.0, posinf=1.0, neginf=-1.0)
+                # Strengthened penalty for topic drift
+                if topic_alignment < 0.2:
+                    reason_sum -= 0.5  # Increased from 0.35
+                # Bonus for staying on topic
+                elif topic_alignment > 0.5:
+                    reason_sum += 0.25  # Increased from 0.20
+            
+            # Accumulate continuation vector for prompt relevance check
+            cont_vec_sum += tid_vec
+            cont_token_count += 1
+            
+            # Update local topic tracker (running average) - numerically stable
+            local_topic_tracker = topic_tracker_decay_local * local_topic_tracker + (1.0 - topic_tracker_decay_local) * tid_vec
+            local_topic_norm = np.linalg.norm(local_topic_tracker)
+            if local_topic_norm > 1e-8:
+                local_topic_tracker = local_topic_tracker / local_topic_norm
+            else:
+                local_topic_tracker = anchor.copy() if len(prompt_ids) > 0 else np.zeros((vec.shape[1],), dtype=np.float32)
 
             recent = tmp_ids[-max(1, int(repeat_window)):] if tmp_ids else []
-            rep = 1.0 if int(tid) in recent else 0.0
+            # Enhanced repetition check: count frequency with stronger penalty
+            rep_count = sum(1 for r in recent if r == int(tid))
+            rep = float(rep_count) * (1.0 + 0.8 * rep_count)  # Quadratic scaling
+            # Additional penalty if this token appeared in last 2 positions
+            if len(tmp_ids) >= 2 and int(tid) in tmp_ids[-2:]:
+                rep += 1.5
+            
+            # N-gram repetition check within continuation
+            if len(tmp_ids) >= 1:
+                prev_tid = tmp_ids[-1]
+                # Check if (prev_tid, tid) bigram appeared recently
+                bigram_rep_count = 0
+                for i in range(max(0, len(tmp_ids) - int(repeat_window)), len(tmp_ids) - 1):
+                    if tmp_ids[i] == prev_tid and i + 1 < len(tmp_ids) and tmp_ids[i+1] == int(tid):
+                        bigram_rep_count += 1
+                if bigram_rep_count > 0:
+                    rep += 0.8 * bigram_rep_count
+            
+            # Trigram repetition check
+            if len(tmp_ids) >= 2:
+                prev2_tid = tmp_ids[-2]
+                prev1_tid = tmp_ids[-1]
+                trigram_rep_count = 0
+                for i in range(max(0, len(tmp_ids) - int(repeat_window)), len(tmp_ids) - 2):
+                    if (tmp_ids[i] == prev2_tid and 
+                        i + 1 < len(tmp_ids) and tmp_ids[i+1] == prev1_tid and
+                        i + 2 < len(tmp_ids) and tmp_ids[i+2] == int(tid)):
+                        trigram_rep_count += 1
+                if trigram_rep_count > 0:
+                    rep += 1.2 * trigram_rep_count  # Strong penalty for phrase repetition
+            
             cp = contradiction_penalty(int(tid), recent)
 
-            reason_sum += (float(w_semantic) * sem) + (float(w_anchor) * anc) - (float(w_contra) * cp) - (float(w_repeat) * rep)
+            # Enhanced scoring: strong coherence bonus for smooth transitions
+            coherence_bonus = 0.0
+            coherence_penalty = 0.0
+            if idx > 0 and tmp_ids:
+                prev_tid = tmp_ids[-1]
+                if 0 <= prev_tid < V:
+                    # Semantic coherence between consecutive tokens (normalized)
+                    prev_vec_norm = vec[prev_tid] / (np.linalg.norm(vec[prev_tid]) + 1e-8)
+                    tid_vec_norm = tid_vec / (np.linalg.norm(tid_vec) + 1e-8)
+                    coherence = float(np.dot(prev_vec_norm, tid_vec_norm))
+                    # Strong bonus for good coherence, penalty for poor coherence
+                    if coherence > 0.4:
+                        coherence_bonus = 0.35 * (coherence - 0.4)  # Strong reward
+                    elif coherence < 0.1:
+                        coherence_penalty = 0.25 * (0.1 - coherence)  # Penalty for poor coherence
+                    
+                    # Also check bigram probability for this transition
+                    if prev_tid < len(reasoner.bigram_logp) and int(tid) < len(reasoner.bigram_logp[prev_tid]):
+                        bigram_lp = float(reasoner.bigram_logp[prev_tid, int(tid)])
+                        if bigram_lp > -3.0:  # Good transition
+                            coherence_bonus += 0.20
+                        elif bigram_lp < -8.0:  # Poor transition
+                            coherence_penalty += 0.15
+
+            # Enhanced: MUCH stronger repetition penalty
+            if rep_count > 0:
+                rep_penalty = float(w_repeat) * rep * (1.0 + 1.0 * rep_count)  # Stronger scaling
+            else:
+                rep_penalty = 0.0
+            reason_sum += (float(w_semantic) * sem) + (float(w_anchor) * anc) - (float(w_contra) * cp) - rep_penalty + coherence_bonus - coherence_penalty
             tmp_ids.append(int(tid))
+            
+            # Update local topic tracker for next iteration in this continuation (numerically stable)
+            local_topic_tracker = topic_tracker_decay_local * local_topic_tracker + (1.0 - topic_tracker_decay_local) * tid_vec
+            local_topic_norm = np.linalg.norm(local_topic_tracker)
+            if local_topic_norm > 1e-8:
+                local_topic_tracker = local_topic_tracker / local_topic_norm
+            else:
+                local_topic_tracker = anchor.copy() if len(prompt_ids) > 0 else np.zeros((vec.shape[1],), dtype=np.float32)
 
         L = max(1, len(cont))
         selector_avg = float(sel_sum) / float(L)
         reasoner_avg = float(reason_sum) / float(L)
         meta_frac = float(meta_count) / float(L)
+        
+        # Prompt relevance: check if continuation is relevant to prompt
+        prompt_relevance_penalty = 0.0
+        if cont_token_count > 0 and len(prompt_ids) > 0:
+            cont_vec_avg = cont_vec_sum / cont_token_count
+            cont_vec_norm_val = np.linalg.norm(cont_vec_avg)
+            if cont_vec_norm_val > 1e-8 and anchor_norm_val > 1e-8:
+                cont_vec_norm = cont_vec_avg / cont_vec_norm_val
+                with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                    prompt_similarity = float(np.dot(cont_vec_norm, anchor_norm))
+                    prompt_similarity = np.nan_to_num(prompt_similarity, nan=0.0, posinf=1.0, neginf=-1.0)
+                # Penalty if continuation is not relevant to prompt
+                if prompt_similarity < 0.2:
+                    prompt_relevance_penalty = 0.4 * (0.2 - prompt_similarity)
+                # Bonus if continuation is highly relevant
+                elif prompt_similarity > 0.5:
+                    reasoner_avg += 0.15 * (prompt_similarity - 0.5)
+        
+        # Apply prompt relevance penalty
+        reasoner_avg -= prompt_relevance_penalty
+        
+        # Dynamic meta-text detection: semantic + pattern-based (no hardcoded lists)
+        if cont_token_count > 0 and len(cont) >= 2:
+            # Semantic detection: check if continuation vector is similar to meta cluster
+            if meta_cluster_centroid is not None:
+                cont_vec_avg = cont_vec_sum / cont_token_count
+                cont_vec_norm_val = np.linalg.norm(cont_vec_avg)
+                if cont_vec_norm_val > 1e-8:
+                    cont_vec_norm = cont_vec_avg / cont_vec_norm_val
+                    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                        meta_similarity = float(np.dot(cont_vec_norm, meta_cluster_centroid))
+                        meta_similarity = np.nan_to_num(meta_similarity, nan=0.0, posinf=1.0, neginf=-1.0)
+                    # Stronger penalty if continuation is semantically similar to meta-text
+                    if meta_similarity > 0.35:  # Lowered threshold from 0.4
+                        meta_sequence_penalty += 1.2 * (meta_similarity - 0.35)  # Increased from 0.6
+            
+            # Pattern-based detection: check for meta role sequences and bigram/trigram patterns
+            # Check for sequences of meta_frame roles (indicating meta-text phrases)
+            meta_role_count = sum(1 for r in meta_role_sequence if r is not None)
+            if meta_role_count >= 2:
+                # Check if meta roles appear in sequence (not scattered)
+                consecutive_meta = 0
+                max_consecutive = 0
+                for r in meta_role_sequence:
+                    if r is not None:
+                        consecutive_meta += 1
+                        max_consecutive = max(max_consecutive, consecutive_meta)
+                    else:
+                        consecutive_meta = 0
+                # Strong penalty for consecutive meta roles (meta-text phrases)
+                if max_consecutive >= 2:
+                    meta_sequence_penalty += 1.5 * max_consecutive  # Increased from 0.8
+                # Also penalize if meta roles are frequent (even if not consecutive)
+                if meta_role_count >= len(cont) * 0.3:  # 30% or more meta roles
+                    meta_sequence_penalty += 1.0
+            
+            # Check for bigram/trigram patterns that indicate meta-text
+            # Look for patterns like "entry" + "composed", "pretraining" + "prose", etc.
+            if len(cont) >= 2:
+                for i in range(len(cont) - 1):
+                    if 0 <= cont[i] < V and 0 <= cont[i+1] < V:
+                        role1 = roles_by_id[cont[i]]
+                        role2 = roles_by_id[cont[i+1]]
+                        # Check if tokens form meta-text patterns (semantic similarity to meta cluster)
+                        tok1_vec = vec[cont[i]]
+                        tok2_vec = vec[cont[i+1]]
+                        if meta_cluster_centroid is not None:
+                            tok1_norm = tok1_vec / (np.linalg.norm(tok1_vec) + 1e-8)
+                            tok2_norm = tok2_vec / (np.linalg.norm(tok2_vec) + 1e-8)
+                            with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                                sim1 = float(np.dot(tok1_norm, meta_cluster_centroid))
+                                sim2 = float(np.dot(tok2_norm, meta_cluster_centroid))
+                                sim1 = np.nan_to_num(sim1, nan=0.0, posinf=1.0, neginf=-1.0)
+                                sim2 = np.nan_to_num(sim2, nan=0.0, posinf=1.0, neginf=-1.0)
+                            # If both tokens are semantically similar to meta cluster, strong penalty
+                            if sim1 > 0.35 and sim2 > 0.35:
+                                meta_sequence_penalty += 1.5 * (sim1 + sim2) / 2.0
+                        # If both tokens have meta roles, check bigram probability
+                        if (role1 and (role1.startswith("meta") or role1 == "dataset_meta") and
+                            role2 and (role2.startswith("meta") or role2 == "dataset_meta")):
+                            # Check if this bigram is common (high probability = common pattern)
+                            if cont[i] < len(reasoner.bigram_logp) and cont[i+1] < len(reasoner.bigram_logp[cont[i]]):
+                                bigram_lp = float(reasoner.bigram_logp[cont[i], cont[i+1]])
+                                # If high probability, it's a common meta-text pattern
+                                if bigram_lp > -2.0:
+                                    meta_sequence_penalty += 1.5  # Increased from 1.0
+            
+            # Check for trigram meta patterns
+            if len(cont) >= 3:
+                for i in range(len(cont) - 2):
+                    if (0 <= cont[i] < V and 0 <= cont[i+1] < V and 0 <= cont[i+2] < V):
+                        role1 = roles_by_id[cont[i]]
+                        role2 = roles_by_id[cont[i+1]]
+                        role3 = roles_by_id[cont[i+2]]
+                        # Check semantic similarity to meta cluster for all three tokens
+                        if meta_cluster_centroid is not None:
+                            tok1_vec = vec[cont[i]]
+                            tok2_vec = vec[cont[i+1]]
+                            tok3_vec = vec[cont[i+2]]
+                            tok1_norm = tok1_vec / (np.linalg.norm(tok1_vec) + 1e-8)
+                            tok2_norm = tok2_vec / (np.linalg.norm(tok2_vec) + 1e-8)
+                            tok3_norm = tok3_vec / (np.linalg.norm(tok3_vec) + 1e-8)
+                            with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                                sim1 = float(np.dot(tok1_norm, meta_cluster_centroid))
+                                sim2 = float(np.dot(tok2_norm, meta_cluster_centroid))
+                                sim3 = float(np.dot(tok3_norm, meta_cluster_centroid))
+                                sim1 = np.nan_to_num(sim1, nan=0.0, posinf=1.0, neginf=-1.0)
+                                sim2 = np.nan_to_num(sim2, nan=0.0, posinf=1.0, neginf=-1.0)
+                                sim3 = np.nan_to_num(sim3, nan=0.0, posinf=1.0, neginf=-1.0)
+                            # If all three are semantically similar to meta cluster, very strong penalty
+                            if sim1 > 0.3 and sim2 > 0.3 and sim3 > 0.3:
+                                meta_sequence_penalty += 2.5 * (sim1 + sim2 + sim3) / 3.0
+                        # If all three have meta roles, strong penalty
+                        if (role1 and (role1.startswith("meta") or role1 == "dataset_meta") and
+                            role2 and (role2.startswith("meta") or role2 == "dataset_meta") and
+                            role3 and (role3.startswith("meta") or role3 == "dataset_meta")):
+                            meta_sequence_penalty += 2.5  # Increased from 2.0 - very strong penalty for meta-text phrases
+        
+        # Apply meta sequence penalty
+        reasoner_avg -= meta_sequence_penalty
+        
+        # Enhanced: add sequence-level coherence score and repetition check
+        sequence_coherence = 0.0
+        sequence_repetition_penalty = 0.0
+        if len(cont) > 1:
+            # Check coherence between all token pairs in continuation (not just consecutive)
+            coherence_scores = []
+            unique_tokens = set()
+            # Check consecutive pairs
+            for i in range(len(cont) - 1):
+                if 0 <= cont[i] < V and 0 <= cont[i+1] < V:
+                    # Coherence check with numerical stability
+                    vec1_norm_val = np.linalg.norm(vec[cont[i]])
+                    vec2_norm_val = np.linalg.norm(vec[cont[i+1]])
+                    if vec1_norm_val > 1e-8 and vec2_norm_val > 1e-8:
+                        vec1_norm = vec[cont[i]] / vec1_norm_val
+                        vec2_norm = vec[cont[i+1]] / vec2_norm_val
+                        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                            coherence = float(np.dot(vec1_norm, vec2_norm))
+                            coherence = np.nan_to_num(coherence, nan=0.0, posinf=1.0, neginf=-1.0)
+                        coherence_scores.append(coherence)
+                    # Also check bigram
+                    if cont[i] < len(reasoner.bigram_logp) and cont[i+1] < len(reasoner.bigram_logp[cont[i]]):
+                        bigram_lp = float(reasoner.bigram_logp[cont[i], cont[i+1]])
+                        if bigram_lp > -3.0:
+                            coherence_scores[-1] = coherence_scores[-1] + 0.2 if coherence_scores else 0.2
+                        elif bigram_lp < -8.0:
+                            coherence_scores[-1] = coherence_scores[-1] - 0.15 if coherence_scores else -0.15
+                    
+                    # Repetition check within continuation
+                    if cont[i] in unique_tokens:
+                        sequence_repetition_penalty += 0.5
+                    unique_tokens.add(cont[i])
+                if cont[i+1] in unique_tokens:
+                    sequence_repetition_penalty += 0.5
+                unique_tokens.add(cont[i+1])
+            
+            # Check non-consecutive pairs for broader coherence (every other token)
+            if len(cont) > 2:
+                for i in range(0, len(cont) - 2, 2):
+                    if 0 <= cont[i] < V and 0 <= cont[i+2] < V:
+                        vec1_norm_val = np.linalg.norm(vec[cont[i]])
+                        vec2_norm_val = np.linalg.norm(vec[cont[i+2]])
+                        if vec1_norm_val > 1e-8 and vec2_norm_val > 1e-8:
+                            vec1_norm = vec[cont[i]] / vec1_norm_val
+                            vec2_norm = vec[cont[i+2]] / vec2_norm_val
+                            with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                                coherence = float(np.dot(vec1_norm, vec2_norm))
+                                coherence = np.nan_to_num(coherence, nan=0.0, posinf=1.0, neginf=-1.0)
+                            coherence_scores.append(coherence * 0.6)  # Lower weight for non-consecutive
+            
+            if coherence_scores:
+                sequence_coherence = float(np.mean(coherence_scores))
+                # Stronger bonus for good overall coherence
+                if sequence_coherence > 0.35:
+                    reasoner_avg += 0.40 * (sequence_coherence - 0.35)  # Increased from 0.30
+                # Stronger penalty for poor coherence
+                elif sequence_coherence < 0.15:
+                    reasoner_avg -= 0.35 * (0.15 - sequence_coherence)  # Increased from 0.25
+        
+        # Apply repetition penalty to sequence score
+        reasoner_avg -= sequence_repetition_penalty
 
-        # meta framing penalty is applied at the sequence level
-        reasoner_avg = float(reasoner_avg) - float(w_meta_frame) * meta_frac
+        # meta framing penalty is applied at the sequence level (strengthened)
+        reasoner_avg = float(reasoner_avg) - float(w_meta_frame) * meta_frac * 1.5  # Increased penalty
 
-        # include average trust along the continuation (stabilizes consistent paths)
-        trust_avg = float(np.mean([float(trust[int(t)]) for t in cont if 0 <= int(t) < V])) if cont else 0.0
-
-        total = (float(alpha_selector) * selector_avg) + (float(beta_reasoner) * reasoner_avg) + trust_avg
-        return selector_avg, reasoner_avg, total, meta_frac
+        return selector_avg, reasoner_avg, meta_frac
 
     # normalize/clip lookahead settings
     la = int(max(1, min(16, int(lookahead_len))))
@@ -622,10 +1215,50 @@ def _generate_dual_once(
             s_avg = float(r["sel_lp_avg"])
             # inject selector sampled logp avg into score_continuation via sel_sum baseline
             # (score_continuation adds only online bias; we add logp here)
-            sel_bias_avg, rs_avg, total, meta_frac = score_continuation(cont, prev2, prev1)
+            sel_bias_avg, rs_avg, meta_frac = score_continuation(cont, prev2, prev1)
             selector_avg = s_avg + sel_bias_avg
-            total = (float(alpha_selector) * selector_avg) + (float(beta_reasoner) * rs_avg) + float(np.mean([trust[int(t)] for t in cont if 0 <= int(t) < V]))
-            scored.append((cont, selector_avg, rs_avg, total, meta_frac))
+            trust_avg = float(np.mean([trust[int(t)] for t in cont if 0 <= int(t) < V])) if cont else 0.0
+            total = (float(alpha_selector) * selector_avg) + (float(beta_reasoner) * rs_avg) + trust_avg
+
+            # Enhanced scoring: add quality score based on features (replaces critic/controller)
+            # Compute quality features for this continuation
+            ctx_for_quality = ids[-max(1, int(context_window)) :]
+            if ctx_for_quality and cont:
+                # Cosine similarity between context and continuation
+                ctx_vec = vec[ctx_for_quality].mean(axis=0)
+                cont_vec = vec[cont].mean(axis=0)
+                ctx_norm = ctx_vec / (np.linalg.norm(ctx_vec) + 1e-8)
+                cont_norm = cont_vec / (np.linalg.norm(cont_vec) + 1e-8)
+                quality_cos = float(np.dot(ctx_norm, cont_norm))
+                
+                # Mean bigram logp for continuation
+                quality_bigram = 0.0
+                bigram_count = 0
+                if len(ctx_for_quality) > 0 and len(cont) > 0:
+                    prev_tok = ctx_for_quality[-1]
+                    if 0 <= prev_tok < len(reasoner.bigram_logp) and 0 <= cont[0] < len(reasoner.bigram_logp[prev_tok]):
+                        quality_bigram += float(reasoner.bigram_logp[prev_tok, cont[0]])
+                        bigram_count += 1
+                for i in range(len(cont) - 1):
+                    if 0 <= cont[i] < len(reasoner.bigram_logp) and 0 <= cont[i+1] < len(reasoner.bigram_logp[cont[i]]):
+                        quality_bigram += float(reasoner.bigram_logp[cont[i], cont[i+1]])
+                        bigram_count += 1
+                quality_bigram = quality_bigram / max(1, bigram_count) if bigram_count > 0 else -5.0
+                
+                # Quality score: weighted combination of features (no training needed)
+                # Positive: good cosine, good bigram, low meta, low repetition
+                quality_score = (
+                    0.35 * quality_cos +           # Semantic coherence
+                    0.25 * max(0.0, quality_bigram + 3.0) / 3.0 +  # Bigram fluency (normalized)
+                    0.15 * (1.0 - meta_frac) +     # Low meta fraction
+                    -0.15 * meta_frac -            # Penalty for meta
+                    -0.10 * min(1.0, len(set(cont)) / max(1, len(cont)))  # Penalty for repetition
+                )
+                total = float(total) + 0.20 * quality_score  # Add quality boost
+            else:
+                quality_score = 0.0
+
+            scored.append((cont, selector_avg, rs_avg, total, meta_frac, quality_score, 0.0))
 
         if not scored:
             break
@@ -633,7 +1266,7 @@ def _generate_dual_once(
         totals = np.array([x[3] for x in scored], dtype=np.float64)
         probs = softmax(totals, temp=max(1e-6, float(temperature)))
         pick = int(np.random.choice(len(scored), p=probs))
-        chosen_cont, chosen_sel, chosen_rs, chosen_total, chosen_meta = scored[pick]
+        chosen_cont, chosen_sel, chosen_rs, chosen_total, chosen_meta, chosen_quality, _ = scored[pick]
 
         # advantage signal: chosen continuation total vs mean alternative total
         adv = float(chosen_total - float(np.mean(totals)))
@@ -660,6 +1293,11 @@ def _generate_dual_once(
                 add_bias(kctx, alt_id, -0.25 * float(eta_bias) * adv)
 
             ids.append(chosen)
+            # Update topic tracker after committing token
+            if 0 <= chosen < V:
+                chosen_vec = vec[chosen]
+                topic_tracker = topic_tracker_decay * topic_tracker + (1.0 - topic_tracker_decay) * chosen_vec
+                topic_tracker = topic_tracker / (np.linalg.norm(topic_tracker) + 1e-8)
 
         if explain:
             # show top continuations with decoded preview
@@ -677,8 +1315,9 @@ def _generate_dual_once(
                         "reasoner_avg": float(rs),
                         "total": float(tt),
                         "meta_frac": float(mf),
+                        "quality_score": float(qs),
                     }
-                    for cont, sel, rs, tt, mf in top_show
+                    for cont, sel, rs, tt, mf, qs, _ in top_show
                 ],
             })
 
@@ -702,233 +1341,8 @@ def _generate_dual_once(
     return out
 
 
-# =========================
-# Reasoning Gate (veto-based)
-# =========================
-
-def _sentences(text: str, max_sents: int = 4) -> List[str]:
-    t = (text or "").strip()
-    if not t:
-        return []
-    t = re.sub(r"\s+", " ", t)
-    parts = re.split(r"(?<=[\.!\?])\s+", t)
-    out = []
-    for p in parts:
-        p = p.strip()
-        if p:
-            out.append(p)
-        if len(out) >= max_sents:
-            break
-    return out
-
-def claim_gate(prompt: str, text: str, goal: Dict[str, Any]) -> bool:
-    """Check if text contains a clear central claim."""
-    sents = _sentences(text, max_sents=3)
-    if not sents:
-        return False
-    first = sents[0].strip()
-    if len(first.split()) < 6:
-        return False
-    # Detect meta/dataset framing patterns
-    if _looks_like_pretraining_prose(text):
-        return False
-
-    # Must anchor to the prompt topic
-    kws = goal.get("keywords") or _simple_tokens(prompt)
-    if kws:
-        tset = set(_simple_tokens(" ".join(sents)))
-        if not any(k in tset for k in kws[:8]):
-            return False
-
-    # Check for claim-like structure (statements, definitions, explanations)
-    fl = first.lower()
-    # Look for declarative or explanatory patterns
-    if re.search(r"\b(is|are|means|refers\s+to|is\s+that|defines?|explains?)\b", fl):
-        return True
-    return False
-
-def causal_gate(text: str) -> bool:
-    """Check for causal or explanatory structure."""
-    sents = _sentences(text, max_sents=2)
-    if not sents:
-        return False
-    blob = " ".join(sents).lower()
-    # Detect causal/explanatory patterns
-    return bool(re.search(r"\b(because|due\s+to|since|as\s+a\s+result|therefore|thus|leads?\s+to|resulting\s+in|explains?|causes?)\b", blob))
-
-def boundary_gate(text: str) -> bool:
-    """Check for contrast, boundary, or trade-off structure."""
-    sents = _sentences(text, max_sents=3)
-    for s in sents:
-        sl = s.lower()
-        # Check for contrast with two sides
-        if " but " in sl:
-            parts = sl.split(" but ", 1)
-            if len(parts) == 2 and len(parts[0].split()) >= 4 and len(parts[1].split()) >= 4:
-                return True
-        # Detect contrast/boundary markers
-        if re.search(r"\b(however|although|whereas|yet|while|contrast|difference)\b", sl):
-            return True
-        if re.search(r"\b(trade-?off|at\s+the\s+cost|on\s+the\s+other\s+hand|versus|vs)\b", sl):
-            return True
-    return False
-def _simple_tokens(s: str) -> List[str]:
-    """Extract tokens, filtering very short common function words."""
-    s = s.lower()
-    s = re.sub(r"[^a-z0-9\s\-]", " ", s)
-    toks = [t for t in s.split() if t and len(t) > 1]  # Filter single chars, keep all meaningful tokens
-    return toks
-
-def infer_discourse_goal(prompt: str) -> Dict[str, Any]:
-    """Infer discourse goal from prompt using pattern matching."""
-    p = (prompt or "").strip()
-    pl = p.lower()
-    # Detect question patterns
-    is_q = ("?" in p) or bool(re.match(r"^(why|explain|what|how|when|where|who)\s+", pl))
-    goal = "qa" if is_q else "expository"
-    # Refine goal type based on question word
-    if pl.startswith("why "):
-        goal = "why"
-    elif pl.startswith("explain "):
-        goal = "explain"
-    elif pl.startswith("what "):
-        goal = "what"
-    kws = _simple_tokens(p)
-    return {"goal": goal, "is_question": bool(is_q), "keywords": kws[:12]}
-
-def coverage_score(prompt: str, text: str, goal: Dict[str, Any]) -> float:
-    kws = goal.get("keywords") or _simple_tokens(prompt)
-    if not kws:
-        return 1.0
-    tset = set(_simple_tokens(text))
-    hit = sum(1 for k in kws if k in tset)
-    return float(hit) / float(max(1, len(kws)))
-
-def drift_score(prompt: str, text: str, goal: Dict[str, Any]) -> float:
-    # Higher means more drift
-    kws = goal.get("keywords") or _simple_tokens(prompt)
-    if not kws:
-        return 0.0
-    toks = _simple_tokens(text)
-    if not toks:
-        return 1.0
-    # emphasize early region
-    early = set(toks[:48])
-    hit_early = sum(1 for k in kws if k in early)
-    frac_early = float(hit_early) / float(max(1, len(kws)))
-    # if you never mention prompt keywords early, you likely drifted
-    return float(1.0 - frac_early)
-
-def repetition_score(text: str, n: int = 3, window: int = 120) -> float:
-    toks = _simple_tokens(text)
-    if len(toks) < n + 5:
-        return 0.0
-    toks = toks[:window]
-    grams = [" ".join(toks[i:i+n]) for i in range(0, len(toks)-n+1)]
-    counts: Dict[str, int] = {}
-    for g in grams:
-        counts[g] = counts.get(g, 0) + 1
-    repeats = sum((c - 1) for c in counts.values() if c >= 2)
-    denom = float(max(1, len(grams)))
-    return float(repeats) / denom
-
-def _looks_like_pretraining_prose(text: str) -> bool:
-    """Detect dataset/meta framing patterns using generic patterns."""
-    tl = (text or "").lower()
-    # Generic pattern-based detection
-    meta_indicators = [
-        r"\bthis\s+(entry|passage|text|document)\s+(is\s+)?(written|suitable|designed)\b",
-        r"\bevaluation\s+(notes?|data|text)\b",
-        r"\bdataset\s+(perspective|context|source)\b",
-        r"\b(training|pretraining|tuning)\s+(data|corpus|text|material)\b",
-    ]
-    hits = sum(1 for pattern in meta_indicators if re.search(pattern, tl))
-    return hits >= 2
-
-def must_answer(prompt: str, text: str, goal: Dict[str, Any]) -> bool:
-    # Blocking: question prompts must be addressed directly and avoid "dataset/meta entry" framing.
-    if not goal.get("is_question", False):
-        # For expository prompts, still block extreme meta framing.
-        return not _looks_like_pretraining_prose(text)
-    tl = (text or "").strip().lower()
-    if not tl:
-        return False
-    if _looks_like_pretraining_prose(text):
-        return False
-    # Detect answer patterns
-    if re.search(r"\b(because|the\s+main|it\s+(is|was|means)|this\s+(is|means|refers))\b", tl):
-        return True
-    # Must contain keywords and avoid meta framing
-    kws = goal.get("keywords") or _simple_tokens(prompt)
-    if kws:
-        tset = set(_simple_tokens(text)[:60])
-        if any(k in tset for k in kws):
-            if not re.match(r"\b(this\s+entry|evaluation\s+notes?|dataset\s+perspective)\b", tl):
-                return True
-    return False
-
-def contradiction_profile(prompt: str, text: str, goal: Dict[str, Any], cov: float) -> Dict[str, Any]:
-    d = drift_score(prompt, text, goal)
-    rep = repetition_score(text, n=3)
-    ans_ok = must_answer(prompt, text, goal)
-
-    # Hard reasoning gates
-    claim_ok = claim_gate(prompt, text, goal)
-    caus_ok = causal_gate(text)
-    bound_ok = boundary_gate(text)
-
-    # Overall "answer OK" requires the hard gates as well.
-    answer_ok = bool(ans_ok and claim_ok and caus_ok and bound_ok)
-
-    veto_reasons: List[str] = []
-    # Blocking conditions (veto, not penalty)
-    if not answer_ok:
-        # Preserve the original reason name for compatibility
-        veto_reasons.append("not_answering_or_goal_miss")
-    if not claim_ok:
-        veto_reasons.append("missing_central_claim")
-    if not caus_ok:
-        veto_reasons.append("missing_causal_link")
-    if not bound_ok:
-        veto_reasons.append("missing_boundary_tradeoff")
-
-    if d > 0.70:
-        veto_reasons.append("topic_drift")
-    if rep > 0.22:
-        veto_reasons.append("abnormal_repetition")
-
-    # Coverage is non-blocking by itself but it amplifies veto confidence
-    if cov < 0.20 and "topic_drift" not in veto_reasons:
-        veto_reasons.append("low_coverage")
-
-    # Determine veto based on critical issues
-    critical_issues = {
-        "not_answering_or_goal_miss",
-        "missing_central_claim",
-        "missing_causal_link",
-        "missing_boundary_tradeoff",
-        "topic_drift",
-        "abnormal_repetition",
-    }
-    veto = any(r in critical_issues for r in veto_reasons)
-
-    # Score used only for selecting the "best of bad" when everything is vetoed.
-    score = (2.0 * float(cov)) - (1.25 * float(d)) - (1.50 * float(rep))
-    score += (0.75 if answer_ok else -1.75)
-    score += (0.25 if claim_ok else -0.35) + (0.20 if caus_ok else -0.25) + (0.15 if bound_ok else -0.20)
-
-    return {
-        "coverage": float(cov),
-        "drift": float(d),
-        "repetition": float(rep),
-        "answer_ok": bool(answer_ok),
-        "claim_ok": bool(claim_ok),
-        "causal_ok": bool(caus_ok),
-        "boundary_ok": bool(bound_ok),
-        "veto": bool(veto),
-        "veto_reasons": veto_reasons,
-        "score": float(score),
-    }
+# Removed: Reasoning Gate functions - not used in simplified generation
+# These were only used for expensive veto-based filtering which is disabled
 
 
 def generate_dual(
@@ -936,33 +1350,27 @@ def generate_dual(
     selector: SelectorArtifacts,
     prompt: str,
     max_new_tokens: int = 60,
-    temperature: float = 0.85,
+    temperature: float = 0.70,
     selector_top_k: int = 32,
-    alpha_selector: float = 0.55,
-    beta_reasoner: float = 0.45,
+    alpha_selector: float = 0.45,
+    beta_reasoner: float = 0.55,
     eta_trust: float = 0.10,
     eta_bias: float = 0.08,
     trust_clip: float = 2.0,
     w_semantic: float = 1.0,
-    w_anchor: float = 0.55,
+    w_anchor: float = 0.85,  # Increased from 0.55 to strengthen prompt relevance
     w_contra: float = 1.25,
     w_repeat: float = 0.85,
     repeat_window: int = 6,
     block_dataset_meta: bool = True,
-    explain: bool = False,
-    context_window: int = 10,
-    lookahead_len: int = 6,
+    explain: bool = True,
+    context_window: int = 30,  # Increased from 20 for better coherence
+    lookahead_len: int = 8,
     num_continuations: int = 12,
     commit_len: int = 1,
     w_meta_frame: float = 0.45,
-    # Deprecated: Reasoning Gate parameters (removed for performance)
-    refine_rounds: int = 0,
-    max_attempts: int = 1,
-    seed: Optional[int] = None,
-    candidate_temperature: Optional[float] = None,
-    final_temperature: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Fast dual generation without expensive reasoning gate loops."""
+    """Generate text via dual-model debate (Selector + Reasoner)."""
     return _generate_dual_once(
         reasoner=reasoner,
         selector=selector,

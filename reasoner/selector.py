@@ -86,14 +86,20 @@ class SelectorArtifacts:
 
 
 def _log_normalize(counts: Dict[int, float], alpha: float = 0.5) -> List[Tuple[int, float]]:
-    # add-alpha smoothing over observed items only (keeps sparse)
+    # Improved add-alpha smoothing with better handling of rare events
     items = list(counts.items())
     if not items:
         return []
-    total = sum(v for _, v in items) + alpha * len(items)
+    # Adaptive smoothing: more smoothing for contexts with fewer observations
+    n_items = len(items)
+    total = sum(v for _, v in items)
+    # Adjust alpha based on context frequency (more smoothing for rare contexts)
+    adaptive_alpha = alpha * (1.0 + 0.5 * math.log1p(max(0, 10 - n_items)))
+    total_smooth = total + adaptive_alpha * n_items
     out = []
     for k, v in items:
-        p = (v + alpha) / max(1e-12, total)
+        # Improved probability calculation
+        p = (v + adaptive_alpha) / max(1e-12, total_smooth)
         out.append((int(k), float(math.log(p + 1e-12))))
     out.sort(key=lambda x: x[1], reverse=True)
     return out
