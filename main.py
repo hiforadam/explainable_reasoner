@@ -19,21 +19,26 @@ def cmd_build_token_desc(args):
 
 
 def cmd_train(args):
+    import gc
     ex = load_examples(args.data)
     texts = [t for _, t in ex]
     token_desc = load_token_descriptions(args.token_desc) if args.token_desc else {}
-    art = train_reasoner(
+    art, _, _ = train_reasoner(
         texts=texts,
         token_desc=token_desc,
         dim=args.dim,
         window=args.window,
         desc_alpha=args.desc_alpha,
+        max_vocab_size=args.max_vocab_size,
     )
     art.save(args.artifacts)
     print(f"[train] vocab={len(art.vocab)} dim={art.vectors.shape[1]} saved to {args.artifacts}")
+    del ex, texts, token_desc
+    gc.collect()
 
 
 def cmd_train_dual(args):
+    import gc
     ex = load_examples(args.data)
     texts = [t for _, t in ex]
     token_desc = load_token_descriptions(args.token_desc) if args.token_desc else {}
@@ -45,11 +50,15 @@ def cmd_train_dual(args):
         desc_alpha=args.desc_alpha,
         selector_smooth=args.selector_smooth,
         selector_max_per_context=args.selector_max_per_context,
+        max_vocab_size=args.max_vocab_size,
     )
     reasoner.save(args.artifacts)
     selector.save(args.artifacts)
     print(f"[train-dual] reasoner vocab={len(reasoner.vocab)} dim={reasoner.vectors.shape[1]} saved to {args.artifacts}")
     print(f"[train-dual] selector contexts={len(selector.trigram_logp)} (trigram) + {len(selector.bigram_logp)} (bigram) saved to {args.artifacts}")
+    # Cleanup intermediate data
+    del ex, texts, token_desc
+    gc.collect()
 
 
 def cmd_generate(args):
@@ -146,6 +155,7 @@ def main():
     p_tr.add_argument("--dim", type=int, default=32)
     p_tr.add_argument("--window", type=int, default=2)
     p_tr.add_argument("--desc_alpha", type=float, default=0.35)
+    p_tr.add_argument("--max_vocab_size", type=int, default=50000, help="Maximum vocabulary size (default: 50000)")
     p_tr.set_defaults(func=cmd_train)
 
     p_td = sub.add_parser("train-dual")
@@ -157,6 +167,7 @@ def main():
     p_td.add_argument("--desc_alpha", type=float, default=0.35)
     p_td.add_argument("--selector_smooth", type=float, default=0.5)
     p_td.add_argument("--selector_max_per_context", type=int, default=256)
+    p_td.add_argument("--max_vocab_size", type=int, default=50000, help="Maximum vocabulary size (default: 50000)")
     p_td.set_defaults(func=cmd_train_dual)
 
     # Finetune command disabled - module not available

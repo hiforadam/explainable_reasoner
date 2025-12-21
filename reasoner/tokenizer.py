@@ -1,6 +1,7 @@
 import re
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Iterator, Optional
+from collections import Counter
 
 _TOKEN_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|[0-9]+|[^\sA-Za-z0-9]")
 
@@ -14,13 +15,45 @@ class ClosedVocabTokenizer:
     token_to_id: Dict[str, int]
 
     @classmethod
-    def from_texts(cls, texts: List[str]) -> "ClosedVocabTokenizer":
-        seen = {}
+    def from_texts(cls, texts: List[str], max_vocab_size: Optional[int] = None) -> "ClosedVocabTokenizer":
+        """Build vocab from texts. If max_vocab_size is set, keep only top tokens by frequency."""
+        seen = Counter()
         for tx in texts:
             for tok in simple_tokenize(tx):
-                seen[tok] = seen.get(tok, 0) + 1
-        vocab = sorted(seen.keys())
-        token_to_id = {t:i for i,t in enumerate(vocab)}
+                seen[tok] += 1
+        
+        # Sort by frequency (descending), then alphabetically
+        if max_vocab_size and len(seen) > max_vocab_size:
+            # Keep top N by frequency
+            top_tokens = [tok for tok, _ in seen.most_common(max_vocab_size)]
+            vocab = sorted(top_tokens)
+        else:
+            vocab = sorted(seen.keys())
+        
+        token_to_id = {t: i for i, t in enumerate(vocab)}
+        return cls(vocab=vocab, token_to_id=token_to_id)
+    
+    @classmethod
+    def from_text_stream(cls, text_stream: Iterator[str], max_vocab_size: Optional[int] = None, 
+                         sample_size: int = 100000) -> "ClosedVocabTokenizer":
+        """Build vocab by streaming texts. Uses first sample_size texts for vocab building."""
+        seen = Counter()
+        count = 0
+        for tx in text_stream:
+            if count >= sample_size:
+                break
+            for tok in simple_tokenize(tx):
+                seen[tok] += 1
+            count += 1
+        
+        # Sort by frequency (descending), then alphabetically
+        if max_vocab_size and len(seen) > max_vocab_size:
+            top_tokens = [tok for tok, _ in seen.most_common(max_vocab_size)]
+            vocab = sorted(top_tokens)
+        else:
+            vocab = sorted(seen.keys())
+        
+        token_to_id = {t: i for i, t in enumerate(vocab)}
         return cls(vocab=vocab, token_to_id=token_to_id)
 
     def encode(self, text: str) -> List[int]:
