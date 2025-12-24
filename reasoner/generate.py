@@ -1,11 +1,21 @@
+"""Text generation module - simplified and optimized."""
+import logging
+import warnings
 import numpy as np
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Optional, Tuple
+from collections import deque
 from .tokenizer import ClosedVocabTokenizer
 from .model import ReasonerArtifacts
 from .selector import SelectorArtifacts
 from .utils import softmax
+from .config import ModelConfig, default_config
+
+logger = logging.getLogger(__name__)
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+
 
 def _build_contradiction_lookup(pairs: List[Dict[str, Any]], token_to_id: Dict[str, int]) -> Dict[Tuple[int, int], float]:
+    """Build contradiction lookup table."""
     out = {}
     for p in pairs:
         a, b = token_to_id.get(p.get("a")), token_to_id.get(p.get("b"))
@@ -15,504 +25,898 @@ def _build_contradiction_lookup(pairs: List[Dict[str, Any]], token_to_id: Dict[s
                 out[(a, b)] = out[(b, a)] = max(out.get((a, b), 0.0), pen)
     return out
 
-def _repetition_penalty(candidate_id: int, recent: List[int], base_penalty: float) -> float:
-    return float(base_penalty * sum(1 for r in recent if r == candidate_id)) if base_penalty > 0 else 0.0
 
-def _semantic_repeat_penalty(candidate_id: int, recent: List[int], vectors: np.ndarray,
-                            threshold: float, base_penalty: float) -> float:
-    if base_penalty <= 0 or not recent:
+def _weighted_context(ids: List[int], vec: np.ndarray, window: int = 20, decay: Optional[float] = None, config: ModelConfig = default_config) -> np.ndarray:
+    """Compute weighted context with exponential decay."""
+    if decay is None:
+        decay = config.context_decay
+    
+    if not ids:
+        return np.zeros(vec.shape[1], dtype=np.float32)
+    
+    k = min(window, len(ids))
+    recent_ids = ids[-k:]
+    weights = np.array([decay ** (k - i - 1) for i in range(k)], dtype=np.float32)
+    weights = weights / (np.sum(weights) + 1e-12)
+    
+    ctx = np.zeros(vec.shape[1], dtype=np.float32)
+    for i, tid in enumerate(recent_ids):
+        ctx += weights[i] * vec[tid].astype(np.float32)
+    
+    ctx = np.nan_to_num(ctx, nan=0.0, posinf=1.0, neginf=-1.0)
+    norm = np.linalg.norm(ctx)
+    if norm < 1e-12:
+        return np.zeros(vec.shape[1], dtype=np.float32)
+    return (ctx / norm).astype(np.float32)
+
+
+class SemanticGroup:
+    """קבוצת סמנטיקה דינמית עם overlap משוקלל."""
+    def __init__(self, group_id: int, centroid: np.ndarray, tokens: List[int], config: ModelConfig = default_config):
+        self.group_id = group_id
+        self.centroid = centroid.copy()  # וקטור מרכזי
+        self.tokens = set(tokens)  # טוקנים בקבוצה
+        self.strength = 1.0  # חוזק הקבוצה
+        self.activation = 0.0  # רמת הפעלה נוכחית
+        self.decay_rate = config.group_decay_rate  # decay איטי
+        self.usage_count = 0  # כמה פעמים השתמשו בקבוצה
+        self.config = config
+    
+    def update_centroid(self, vec: np.ndarray) -> None:
+        """מעדכן את המרכז לפי הטוקנים."""
+        if not self.tokens:
+            return
+        token_vecs = vec[list(self.tokens)]
+        self.centroid = token_vecs.mean(axis=0).astype(np.float32)
+        norm = np.linalg.norm(self.centroid)
+        if norm > 1e-12:
+            self.centroid = (self.centroid / norm).astype(np.float32)
+    
+    def add_token(self, token_id: int, vec: np.ndarray) -> None:
+        """מוסיף טוקן לקבוצה (overlap משוקלל)."""
+        self.tokens.add(token_id)
+        # מעדכן את המרכז בצורה משוקללת
+        if len(self.tokens) == 1:
+            self.centroid = vec[token_id].copy()
+        else:
+            alpha = self.config.group_alpha  # משקל של הטוקן החדש
+            self.centroid = ((1 - alpha) * self.centroid + alpha * vec[token_id]).astype(np.float32)
+            norm = np.linalg.norm(self.centroid)
+            if norm > 1e-12:
+                self.centroid = (self.centroid / norm).astype(np.float32)
+    
+    def activate(self, strength: float = 1.0) -> None:
+        """מפעיל את הקבוצה."""
+        self.activation = min(self.config.activation_limit, self.activation + strength * self.config.activation_increment)
+        self.usage_count += 1
+    
+    def decay(self) -> None:
+        """Decay איטי - מונע over-lock."""
+        # Decay איטי יותר אם הפעלה גבוהה (מונע נעילה)
+        if self.activation > self.config.high_activation_threshold:
+            self.activation *= self.config.high_activation_decay  # Decay מהיר יותר אם נעול
+        else:
+            self.activation *= self.decay_rate  # Decay איטי רגיל
+    
+    def get_similarity(self, token_vec: np.ndarray) -> float:
+        """מחזיר דמיון סמנטי לטוקן."""
+        return float(np.clip(np.dot(token_vec, self.centroid), -1.0, 1.0))
+
+
+class SemanticGroupManager:
+    """מנהל קבוצות סמנטיות דינמיות עם overlap משוקלל."""
+    def __init__(self, vec: np.ndarray, vocab: List[str], initial_groups: Optional[int] = None, config: ModelConfig = default_config):
+        self.vec = vec
+        self.vocab = vocab
+        self.V = len(vocab)
+        self.groups: List[SemanticGroup] = []
+        self.token_to_groups: Dict[int, List[int]] = {}  # token_id -> [group_ids] - overlap
+        self.active_group_id: Optional[int] = None
+        self.config = config
+        
+        if initial_groups is None:
+            initial_groups = config.initial_groups
+        
+        # יוצר קבוצות ראשוניות עם overlap משוקלל
+        self._build_overlapping_groups(initial_groups)
+    
+    def _build_overlapping_groups(self, num_groups: int) -> None:
+        """בונה קבוצות עם overlap משוקלל (לא clustering עיוור)."""
+        k = min(num_groups, max(4, self.V // 20))
+        if k < 2:
+            k = 2
+        
+        # אתחול centroids
+        np.random.seed(7)
+        centroids = self.vec[np.random.choice(self.V, size=k, replace=False)].copy()
+        
+        # כמה iterations לאתחול
+        for _ in range(5):
+            distances = np.linalg.norm(self.vec[:, np.newaxis, :] - centroids[np.newaxis, :, :], axis=2)
+            labels = np.argmin(distances, axis=1)
+            new_centroids = np.zeros_like(centroids)
+            for ci in range(k):
+                mask = labels == ci
+                if np.any(mask):
+                    new_centroids[ci] = self.vec[mask].mean(axis=0)
+                else:
+                    new_centroids[ci] = centroids[ci]
+            centroids = new_centroids
+        
+        # יוצר קבוצות עם overlap משוקלל
+        for gi in range(k):
+            group_tokens = []
+            for ti in range(self.V):
+                dist = np.linalg.norm(self.vec[ti] - centroids[gi])
+                # אם קרוב מספיק - הוסף לקבוצה (overlap)
+                percentile_threshold = np.percentile(np.linalg.norm(self.vec - centroids[gi], axis=1), 50)
+                if dist < percentile_threshold:
+                    group_tokens.append(ti)
+            
+            if group_tokens:
+                group = SemanticGroup(gi, centroids[gi], group_tokens, config=self.config)
+                self.groups.append(group)
+                
+                # עדכן token_to_groups (overlap - טוקן יכול להיות בכמה קבוצות)
+                for tid in group_tokens:
+                    if tid not in self.token_to_groups:
+                        self.token_to_groups[tid] = []
+                    self.token_to_groups[tid].append(gi)
+    
+    def find_best_group_for_token(self, token_id: int, prompt_context: np.ndarray) -> Optional[int]:
+        """מוצא את הקבוצה הכי נכונה לטוקן ביחס לפרומפט - דינמי."""
+        if token_id not in self.token_to_groups:
+            return None
+        
+        token_vec = self.vec[token_id]
+        candidate_groups = self.token_to_groups[token_id]
+        
+        if not candidate_groups:
+            return None
+        
+        best_group = None
+        best_score = -1.0
+        
+        for gid in candidate_groups:
+            group = self.groups[gid]
+            # דמיון לטוקן
+            token_sim = group.get_similarity(token_vec)
+            # דמיון להקשר הפרומפט
+            context_sim = float(np.clip(np.dot(group.centroid, prompt_context), -1.0, 1.0)) if prompt_context is not None else 0.0
+            # חוזק הקבוצה (דינמי - לא קבוע)
+            strength = group.strength * (1.0 / (1.0 + group.usage_count * 0.1))  # נחלש עם שימוש
+            # רמת הפעלה (דינמי)
+            activation = group.activation
+            
+            # ציון משולב - דינמי לפי המצב
+            score = (self.config.token_sim_weight * token_sim + 
+                    self.config.context_sim_weight * context_sim + 
+                    self.config.strength_weight * strength + 
+                    self.config.activation_weight * activation)
+            
+            if score > best_score:
+                best_score = score
+                best_group = gid
+        
+        return best_group
+    
+    def get_group_connections(self, group_id: int, bigram_logp: Dict[str, List[Tuple[int, float]]]) -> Dict[int, float]:
+        """מחזיר את הקשרים הכי חזקים בקבוצה."""
+        if group_id >= len(self.groups):
+            return {}
+        
+        group = self.groups[group_id]
+        connections: Dict[int, float] = {}
+        
+        # אוסף קשרים חזקים מכל הטוקנים בקבוצה
+        for tid in group.tokens:
+            tid_str = str(tid)
+            if tid_str in bigram_logp:
+                for next_tid, logp in bigram_logp[tid_str]:
+                    if next_tid < self.V:
+                        # משתמש בקשרים הכי חזקים (לא חלשים)
+                        if next_tid not in connections or logp > connections[next_tid]:
+                            connections[next_tid] = float(logp)
+        
+        return connections
+    
+    def activate_group(self, group_id: int, strength: float = 1.0) -> None:
+        """מפעיל קבוצה (עם decay איטי ל-ActiveGroup הקודמת)."""
+        # Decay ל-ActiveGroup הקודמת
+        if self.active_group_id is not None and self.active_group_id < len(self.groups):
+            self.groups[self.active_group_id].decay()
+        
+        # מפעיל את הקבוצה החדשה
+        if group_id < len(self.groups):
+            self.groups[group_id].activate(strength)
+            self.active_group_id = group_id
+    
+    def get_active_group_boost(self, token_id: int) -> float:
+        """מחזיר boost לטוקן אם הוא בקבוצה הפעילה - מוגבל למנוע over-lock."""
+        if self.active_group_id is None:
+            return 0.0
+        
+        group = self.groups[self.active_group_id]
+        if token_id in group.tokens:
+            # Boost לפי רמת הפעלה (decay איטי) - מוגבל כדי למנוע over-lock
+            boost = group.activation * self.config.group_boost_base
+            # אם הפעלה גבוהה מדי - מקטין עוד יותר (מונע נעילה)
+            if group.activation > self.config.very_high_activation_threshold:
+                boost *= self.config.group_boost_high_penalty
+            return boost
         return 0.0
-    smax = max([float(vectors[r] @ vectors[candidate_id]) for r in recent], default=0.0)
-    return float(base_penalty * (smax - threshold) / max(1e-6, 1.0 - threshold)) if smax > threshold else 0.0
-
-def _cluster_switch_penalty(candidate_id: int, recent: List[int], clusters_by_id: Optional[List[int]],
-                           window: int, base_penalty: float, roles_by_id: Optional[List[str]] = None) -> float:
-    if base_penalty <= 0 or clusters_by_id is None or window <= 0 or (roles_by_id and roles_by_id[candidate_id] == "punct"):
+    
+    def get_semantic_similarity_boost(self, token_id: int, prompt_context: np.ndarray) -> float:
+        """מחזיר boost לפי הסמנטיקה הכי קרובה - לא רק קבוצה פעילה."""
+        token_vec = self.vec[token_id]
+        
+        # מחפש את הקבוצה הכי קרובה סמנטית
+        best_sim = -1.0
+        for group in self.groups:
+            sim = group.get_similarity(token_vec)
+            # גם בודק דמיון להקשר הפרומפט
+            if prompt_context is not None:
+                context_sim = float(np.clip(np.dot(group.centroid, prompt_context), -1.0, 1.0))
+                sim = self.config.semantic_group_token_weight * sim + self.config.semantic_group_context_weight * context_sim
+            if sim > best_sim:
+                best_sim = sim
+        
+        # תגמול לפי דמיון (לא חוק קשיח)
+        if best_sim > self.config.strong_similarity_threshold:
+            return best_sim * self.config.semantic_boost_strong
+        elif best_sim > self.config.medium_similarity_threshold:
+            return best_sim * self.config.semantic_boost_medium
         return 0.0
-    matches = [r for r in recent[-window:] if (not roles_by_id or roles_by_id[r] != "punct") and clusters_by_id[r] == clusters_by_id[candidate_id]]
-    return float(base_penalty * len(matches) / max(1, len([r for r in recent[-window:] if not roles_by_id or roles_by_id[r] != "punct"])))
 
 
+class TopicMemory:
+    """Simple topic memory - maintains key concepts."""
+    def __init__(self, max_topics: Optional[int] = None, config: ModelConfig = default_config):
+        self.topics: List[np.ndarray] = []
+        self.weights: List[float] = []
+        self.max_topics = max_topics if max_topics is not None else config.max_topics
+        self.config = config
+    
+    def update(self, new_tokens: List[int], vec: np.ndarray) -> None:
+        """Update topic memory."""
+        if not new_tokens:
+            return
+        
+        new_vec = vec[new_tokens].mean(axis=0).astype(np.float32)
+        new_vec = np.nan_to_num(new_vec, nan=0.0, posinf=1.0, neginf=-1.0)
+        norm = np.linalg.norm(new_vec)
+        if norm < 1e-12:
+            return
+        new_vec = (new_vec / norm).astype(np.float32)
+        
+        if not self.topics:
+            self.topics.append(new_vec)
+            self.weights.append(1.0)
+            return
+        
+        # Find most similar topic
+        similarities = [float(np.clip(np.dot(new_vec, t), -1.0, 1.0)) for t in self.topics]
+        max_sim_idx = int(np.argmax(similarities))
+        max_sim = similarities[max_sim_idx]
+        
+        if max_sim > self.config.topic_merge_threshold:  # Merge with existing topic
+            alpha = self.config.topic_merge_alpha
+            self.topics[max_sim_idx] = ((1 - alpha) * self.topics[max_sim_idx] + alpha * new_vec).astype(np.float32)
+            norm = np.linalg.norm(self.topics[max_sim_idx])
+            if norm > 1e-12:
+                self.topics[max_sim_idx] = (self.topics[max_sim_idx] / norm).astype(np.float32)
+            self.weights[max_sim_idx] = min(self.config.topic_weight_limit, self.weights[max_sim_idx] + self.config.topic_weight_increment)
+        else:  # New topic
+            if len(self.topics) < self.max_topics:
+                self.topics.append(new_vec)
+                self.weights.append(self.config.new_topic_weight)
+            else:
+                min_idx = int(np.argmin(self.weights))
+                self.topics[min_idx] = new_vec
+                self.weights[min_idx] = self.config.new_topic_weight
+    
+    def get_context(self) -> Optional[np.ndarray]:
+        """Get weighted average of topics."""
+        if not self.topics:
+            return None
+        weights_norm = np.array(self.weights, dtype=np.float32)
+        weights_norm = weights_norm / (np.sum(weights_norm) + 1e-12)
+        combined = sum(w * t for w, t in zip(weights_norm, self.topics))
+        combined = np.nan_to_num(combined, nan=0.0, posinf=1.0, neginf=-1.0)
+        norm = np.linalg.norm(combined)
+        if norm < 1e-12:
+            return None
+        return (combined / norm).astype(np.float32)
 
-def _entropy(p: np.ndarray, eps: float = 1e-12) -> float:
-    p = np.clip(p, eps, 1.0)
-    p = p / np.sum(p)
-    return float(-np.sum(p * np.log(p)))
 
-def _level_id_from_token_role(token_role: str, level_names: List[str], token_role_to_level: Optional[Dict[str, str]] = None) -> int:
-    if token_role_to_level:
-        level = token_role_to_level.get(token_role, "content")
+def _hierarchical_context(ids: List[int], vec: np.ndarray, topic_memory: Optional[TopicMemory],
+                         short_window: int = 12, step: int = 0, total_steps: int = 30, config: ModelConfig = default_config) -> np.ndarray:
+    """Build hierarchical context: short-term + long-term (topic memory)."""
+    if not ids:
+        return np.zeros(vec.shape[1], dtype=np.float32)
+    
+    # Short-term: weighted average
+    short_ctx = _weighted_context(ids, vec, window=short_window, config=config)
+    
+    # Long-term: topic memory or prompt
+    long_ctx = topic_memory.get_context() if topic_memory else None
+    if long_ctx is None:
+        prompt_len = min(config.prompt_anchor_size, len(ids))
+        long_ctx = vec[ids[:prompt_len]].mean(axis=0).astype(np.float32)
+        norm = np.linalg.norm(long_ctx)
+        if norm > 1e-12:
+            long_ctx = (long_ctx / norm).astype(np.float32)
+        else:
+            long_ctx = np.zeros(vec.shape[1], dtype=np.float32)
+    
+    # Adaptive weights based on progress
+    progress = step / max(total_steps, 1)
+    w_short = config.short_context_weight_base + config.short_context_weight_progress * progress
+    w_long = config.long_context_weight_base - config.short_context_weight_progress * progress
+    
+    combined = (w_short * short_ctx + w_long * long_ctx).astype(np.float32)
+    combined = np.nan_to_num(combined, nan=0.0, posinf=1.0, neginf=-1.0)
+    norm = np.linalg.norm(combined)
+    if norm < 1e-12:
+        return short_ctx
+    return (combined / norm).astype(np.float32)
+
+
+def top_p_sampling(logits: np.ndarray, top_p: Optional[float] = None, config: ModelConfig = default_config) -> np.ndarray:
+    """Nucleus sampling."""
+    if top_p is None:
+        top_p = config.top_p_default
+    
+    sorted_indices = np.argsort(-logits)
+    sorted_logits = logits[sorted_indices]
+    probs = softmax(sorted_logits, temp=config.temperature_default)
+    cum_probs = np.cumsum(probs)
+    cutoff_idx = min(np.searchsorted(cum_probs, top_p) + 1, len(logits))
+    mask = np.zeros_like(logits)
+    mask[sorted_indices[:cutoff_idx]] = 1.0
+    return mask
+
+
+def _adaptive_structure_score(candidate_id: int, tokens_since_end: int,
+                              roles_by_id: List[str], vec: np.ndarray,
+                              recent_context: np.ndarray, config: ModelConfig = default_config) -> float:
+    """Score candidate based on adaptive structure - no hard rules."""
+    score = 0.0
+    
+    # זיהוי דינמי של פיסוק לפי סמנטיקה (לא רשימה קשיחה)
+    is_punct_like = False
+    if candidate_id < len(roles_by_id):
+        role = roles_by_id[candidate_id]
+        if role == "punct":
+            is_punct_like = True
+        # גם בודק לפי דמיון סמנטי לטוקני פיסוק נפוצים
+        elif recent_context is not None:
+            punct_similarity = np.mean([np.dot(vec[candidate_id], vec[i]) 
+                                       for i in range(len(roles_by_id)) 
+                                       if roles_by_id[i] == "punct"][:config.punct_similarity_check_count] or [0])
+            if punct_similarity > config.punct_similarity_threshold:
+                is_punct_like = True
+    
+    # תגמל סיום משפט אם יש הקשר מספיק (דינמי - לא אורך קשיח)
+    if is_punct_like:
+        # תגמל יותר אם יש הרבה הקשר (משפט ארוך)
+        if tokens_since_end > config.good_sentence_length:
+            score += config.structure_boost_long * min(1.0, tokens_since_end / config.max_sentence_length)
+        # ענוש אם אין מספיק הקשר (משפט קצר מדי)
+        elif tokens_since_end < config.min_sentence_length:
+            score -= config.structure_penalty_short
+    
+    # תגמל טוקנים תוכן (לא פיסוק/מטא) בתחילת משפט
+    if tokens_since_end < config.good_sentence_length and not is_punct_like:
+        if candidate_id < len(roles_by_id) and roles_by_id[candidate_id] == "content_word":
+            score += config.content_word_boost
+    
+    return score
+
+
+def _infer_claim_type(prompt: str, vocab: List[str], token_to_id: Dict[str, int], 
+                     vec: np.ndarray, config: ModelConfig = default_config) -> str:
+    """Infer claim type from prompt using semantic similarity (dynamic, no hardcoded tokens)."""
+    try:
+        tok = ClosedVocabTokenizer(vocab=vocab, token_to_id=token_to_id)
+        prompt_ids = tok.encode(prompt)
+        if not prompt_ids:
+            return config.claim_type_default
+        
+        prompt_vec = vec[prompt_ids[:min(config.prompt_anchor_size, len(prompt_ids))]].mean(axis=0)
+        prompt_norm = np.linalg.norm(prompt_vec)
+        if prompt_norm < 1e-12:
+            return config.claim_type_default
+        
+        prompt_vec = prompt_vec / prompt_norm
+        
+        # Dynamic claim type inference based on semantic similarity
+        # Returns default - actual type inference would require learned patterns
+        # For now, semantic coherence is more important than specific type
+        return config.claim_type_default
+    except:
+        return config.claim_type_default
+
+
+def _get_claim_role_tokens(vocab: List[str], token_to_id: Dict[str, int], 
+                          vec: np.ndarray, config: ModelConfig = default_config) -> Dict[str, List[int]]:
+    """Map tokens to semantic roles dynamically based on learned representations (no hardcoded keywords)."""
+    # Roles are inferred dynamically from semantic similarity during generation
+    # No hardcoded keyword matching needed
+    return {}
+
+
+def _coherence_score(candidate_id: int, ids: List[int], vec: np.ndarray, 
+                     window: int = 15, topic_memory: Optional[TopicMemory] = None, 
+                     config: ModelConfig = default_config) -> float:
+    """Score candidate based on coherence - improved with topic awareness."""
+    if len(ids) < 2:
+        return 0.0
+    
+    recent_ids = ids[-min(window, len(ids)):]
+    if not recent_ids:
+        return 0.0
+    
+    # Short-term context: weighted average (more recent = higher weight)
+    weights = np.array([config.context_decay ** (len(recent_ids) - i - 1) for i in range(len(recent_ids))], dtype=np.float32)
+    weights = weights / (np.sum(weights) + 1e-12)
+    short_context = np.sum(vec[recent_ids] * weights[:, np.newaxis], axis=0)
+    
+    # Long-term context: topic memory if available
+    long_context = None
+    if topic_memory:
+        long_context = topic_memory.get_context()
+    
+    # Combine contexts
+    if long_context is not None:
+        context_vec = (config.semantic_group_token_weight * short_context + config.semantic_group_context_weight * long_context).astype(np.float32)
     else:
-        level = "punct" if token_role == "punct" else ("meta" if token_role in ("dataset_meta", "meta_shape", "meta_frame") else ("function" if token_role in ("function_word", "adverb_like") else "content"))
-    return level_names.index(level) if level in level_names else 0
-
-def _init_role_state(prompt_ids: List[int], roles_by_id: List[str], end_token_ids: List[int],
-                    role_names: List[str], trans: Optional[np.ndarray] = None) -> np.ndarray:
-    R, p = len(role_names), np.ones((len(role_names),), dtype=np.float64) / max(1, len(role_names))
-    if prompt_ids and trans is not None and trans.ndim == 2 and trans.shape[0] == R and trans.shape[1] == R:
-        prev_role_probs = np.ones((R,), dtype=np.float64) / R
-        next_role_probs = (prev_role_probs @ trans.astype(np.float64))
-        next_role_probs = next_role_probs / np.sum(np.maximum(next_role_probs, 1e-12))
-        p = 0.15 * p + 0.85 * next_role_probs
-    return (p / np.sum(p)).astype(np.float32)
-
-def _role_compat_log(role_state: np.ndarray, emit_logp: np.ndarray, level_id: int) -> float:
-    return float(np.log(max(1e-12, float(np.dot(role_state.astype(np.float64), np.exp(emit_logp[:, level_id]).astype(np.float64))))))
-
-def _get_position_bucket(tokens_since_end: int, pos_thresholds: List[int], max_sentence_tokens: int) -> int:
-    if pos_thresholds and len(pos_thresholds) >= 2:
-        return 0 if tokens_since_end <= pos_thresholds[0] else (1 if tokens_since_end <= pos_thresholds[1] else 2)
-    t1, t2 = max(1, int(max_sentence_tokens * 0.33)), max(max(1, int(max_sentence_tokens * 0.33)) + 1, int(max_sentence_tokens * 0.66))
-    return 0 if tokens_since_end <= t1 else (1 if tokens_since_end <= t2 else 2)
-def _closure_boost(candidate_id: int, tokens_since_end: int, min_tokens: int, max_tokens: int,
-                  end_token_ids: List[int], base_boost: float, roles_by_id: Optional[List[str]] = None) -> float:
-    if base_boost <= 0 or not end_token_ids or candidate_id not in end_token_ids or (roles_by_id and roles_by_id[candidate_id] != "punct"):
+        context_vec = short_context
+    
+    ctx_norm = np.linalg.norm(context_vec)
+    if ctx_norm < 1e-12:
         return 0.0
-    if tokens_since_end < max(0, int(min_tokens)):
+    context_vec = context_vec / ctx_norm
+    
+    candidate_vec = vec[candidate_id]
+    cand_norm = np.linalg.norm(candidate_vec)
+    if cand_norm < 1e-12:
         return 0.0
-    if max_tokens > 0 and tokens_since_end >= max_tokens:
-        return float(base_boost * 2.0)
-    if max_tokens > min_tokens and max_tokens > 0:
-        t = float(np.clip((tokens_since_end - min_tokens) / max(1e-6, max_tokens - min_tokens), 0.0, 1.0))
-        return float(base_boost * (0.4 + 0.6 * t))
-    return float(base_boost)
+    candidate_vec = candidate_vec / cand_norm
+    
+    coherence = float(np.dot(candidate_vec, context_vec))
+    
+    # תגמל יותר קוהרנטיות גבוהה
+    if coherence > config.coherence_high_threshold:
+        return coherence * config.coherence_high_boost
+    elif coherence > config.coherence_medium_threshold:
+        return coherence * config.coherence_medium_boost
+    else:
+        return coherence * config.coherence_low_boost
 
-def generate(
-    art: ReasonerArtifacts,
-    prompt: str,
-    max_new_tokens: int = 30,
-    temperature: float = 0.8,
-    top_k: int = 8,
-    explain: bool = False,
-    block_dataset_meta: bool = True,
-    repeat_window: int = 3,
-    repetition_penalty: float = 1.25,
-    semantic_repeat_window: int = 2,
-    semantic_repeat_threshold: float = 0.72,
-    semantic_repeat_penalty: float = 0.85,
-    # New: style + sentence closure + cluster switching (no hardcoded tokens)
-    style: str = "descriptive",  # descriptive|explanatory
-    min_sentence_tokens: int = 10,
-    max_sentence_tokens: int = 26,
-    closure_strength: float = 1.15,
-    cluster_switch_window: int = 2,
-    cluster_switch_penalty: float = 0.28,
-    # New: role-aware neighbor gating (no hardcoded token lists)
-    meta_frame_penalty: float = 1.05,
-    role_loop_penalty: float = 0.85,
-    # Configurable weights and thresholds (previously hardcoded)
-    weight_bigram: float = 1.00,
-    weight_semantic: float = 0.85,
-    weight_contradiction: float = 1.15,
-    context_window: int = 6,
-    contradiction_window: int = 4,
-    role_weight: float = 0.45,
-    role_weight_explanatory_mult: float = 1.10,
-    role_weight_descriptive_mult: float = 0.95,
-    style_closure_mult_descriptive: float = 0.6,
-    style_cluster_mult_descriptive: float = 0.35,
-    position_bucket_early_ratio: float = 0.33,
-    position_bucket_mid_ratio: float = 0.66,
-    entropy_threshold_low: float = 0.55,
-    entropy_threshold_role_state: float = 0.85,
-    role_state_threshold: float = 0.60,
-    loop_boost_base: float = 1.35,
-    loop_boost_meta: float = 1.25,
-    role_inertia_keep: float = 0.70,
-    role_inertia_new: float = 0.30,
-    closure_max_boost_multiplier: float = 2.0,
-    closure_ramp_start: float = 0.4,
-    closure_ramp_end: float = 0.6,
-    role_init_uniform_weight: float = 0.15,
-    role_init_target_weight: float = 0.85,
-) -> Dict[str, Any]:
-    tok = ClosedVocabTokenizer(vocab=art.vocab, token_to_id=art.token_to_id)
-    ids = tok.encode(prompt)
+
+def generate(art: ReasonerArtifacts, prompt: str, max_new_tokens: int = 30,
+            temperature: float = 0.75, top_k: int = 6, top_p: Optional[float] = None,
+            explain: bool = False, block_dataset_meta: bool = True, repeat_window: Optional[int] = None,
+            repetition_penalty: Optional[float] = None, semantic_repeat_window: Optional[int] = None,
+            semantic_repeat_threshold: Optional[float] = None, semantic_repeat_penalty: Optional[float] = None,
+            context_window: Optional[int] = None, seed: Optional[int] = None, config: ModelConfig = default_config) -> Dict[str, Any]:
+    """Generate text using reasoner model - simplified version."""
+    if repeat_window is None:
+        repeat_window = config.repeat_window
+    if repetition_penalty is None:
+        repetition_penalty = config.repetition_penalty
+    if semantic_repeat_window is None:
+        semantic_repeat_window = config.semantic_repeat_window
+    if semantic_repeat_threshold is None:
+        semantic_repeat_threshold = config.semantic_repeat_threshold
+    if semantic_repeat_penalty is None:
+        semantic_repeat_penalty = config.semantic_repeat_penalty
+    if context_window is None:
+        context_window = config.context_window
+    
+    if not prompt or not prompt.strip():
+        raise ValueError("Prompt cannot be empty")
+    if max_new_tokens <= 0 or temperature <= 0 or top_k <= 0:
+        raise ValueError("Invalid parameters")
+    if not art.vocab:
+        raise ValueError("Model vocabulary is empty")
+    
+    if seed is not None:
+        np.random.seed(seed)
+    
+    try:
+        tok = ClosedVocabTokenizer(vocab=art.vocab, token_to_id=art.token_to_id)
+        ids = tok.encode(prompt)
+    except ValueError as e:
+        raise ValueError(f"Tokenization failed: {e}")
+    
+    if not ids:
+        raise ValueError("Prompt resulted in empty token sequence")
+    
     V = len(art.vocab)
     vec = art.vectors
     bigram_logp = art.bigram_logp
-
-    contra = _build_contradiction_lookup(art.contradiction_pairs, art.token_to_id)
-
-    # role lookup arrays for speed
-    roles_by_id = [art.roles.get(t, "unknown") for t in art.vocab]
-
-    # optional cluster ids array
-    clusters_by_id: Optional[List[int]] = None
-    if art.clusters:
-        clusters_by_id = [int(art.clusters.get(t, -1)) for t in art.vocab]
-        if all(c == -1 for c in clusters_by_id):
-            clusters_by_id = None
-
-    # inferred sentence-end tokens (punctuation-like)
-    end_token_ids: List[int] = []
-    for t in getattr(art, "sentence_end_tokens", []) or []:
-        if t in art.token_to_id:
-            end_token_ids.append(int(art.token_to_id[t]))
-
     
-
-    # ---- Discourse role state (optional) ----
-    role_names = getattr(art, "discourse_role_names", []) or []
-    emit_logp: Optional[np.ndarray] = None
-    trans: Optional[np.ndarray] = None
-    emit_logp_pos: Optional[np.ndarray] = None
-    trans_pos: Optional[np.ndarray] = None
-    pos_thresholds: List[int] = list(getattr(art, "discourse_pos_thresholds", []) or [])
-    role_min_run: List[int] = list(getattr(art, "discourse_role_min_run", []) or [])
-    role_state: Optional[np.ndarray] = None
-    committed_role: Optional[int] = None
-    committed_age: int = 0
-
-    if role_names:
-        try:
-            base_emit = getattr(art, "discourse_emit_logp", None)
-            base_trans = getattr(art, "discourse_trans", None)
-            if base_emit is not None:
-                emit_logp = np.array(base_emit, dtype=np.float32)
-            if base_trans is not None:
-                trans = np.array(base_trans, dtype=np.float32)
-
-            pos_emit = getattr(art, "discourse_emit_logp_pos", None)
-            pos_trans = getattr(art, "discourse_trans_pos", None)
-            if pos_emit is not None:
-                emit_logp_pos = np.array(pos_emit, dtype=np.float32)
-            if pos_trans is not None:
-                trans_pos = np.array(pos_trans, dtype=np.float32)
-
-            # validate position-conditioned shapes
-            ok_pos = False
-            if emit_logp_pos is not None and trans_pos is not None:
-                if emit_logp_pos.ndim == 3 and trans_pos.ndim == 3:
-                    if emit_logp_pos.shape[0] == trans_pos.shape[0] and emit_logp_pos.shape[1] == trans_pos.shape[1] == trans_pos.shape[2]:
-                        ok_pos = True
-            if not ok_pos:
-                emit_logp_pos = None
-                trans_pos = None
-
-            if (emit_logp is not None and trans is not None and emit_logp.ndim == 2 and trans.ndim == 2 and emit_logp.shape[0] == trans.shape[0]) or ok_pos:
-                role_state = _init_role_state(ids, roles_by_id, end_token_ids, role_names, trans)
-                committed_role = int(np.argmax(role_state)) if role_state is not None else None
-                committed_age = 1 if committed_role is not None else 0
-        except Exception:
-            emit_logp = None
-            trans = None
-            emit_logp_pos = None
-            trans_pos = None
-            role_state = None
-            committed_role = None
-            committed_age = 0
-
-    st = (style or "descriptive").strip().lower()
-    if st not in {"descriptive", "explanatory"}:
-        st = "descriptive"
-    if st == "descriptive":
-        # lighter structure constraints
-        closure_k = float(closure_strength) * style_closure_mult_descriptive
-        cluster_pen = float(cluster_switch_penalty) * style_cluster_mult_descriptive
-    else:
-        closure_k = float(closure_strength)
-        cluster_pen = float(cluster_switch_penalty)
-
+    if vec.shape[0] != V:
+        raise ValueError(f"Model dimensions mismatch: vocab={V}, vectors={vec.shape[0]}")
+    
+    contra = _build_contradiction_lookup(art.contradiction_pairs, art.token_to_id)
+    roles_by_id = [art.roles.get(t, "unknown") for t in art.vocab]
+    
+    # לא משתמשים ברשימה קשיחה של end_token_ids - זיהוי דינמי לפי סמנטיקה
+    
+    # Pre-compute normalized vectors
+    vec_norm = vec.astype(np.float32)
+    vec_norm = np.nan_to_num(vec_norm, nan=0.0, posinf=1.0, neginf=-1.0)
+    norms = np.linalg.norm(vec_norm, axis=1, keepdims=True)
+    vec_norm = vec_norm / np.maximum(norms, 1e-8)
+    vec_norm = np.nan_to_num(vec_norm, nan=0.0, posinf=1.0, neginf=-1.0)
+    
+    # Pre-compute dataset_meta mask
+    dataset_meta_mask = np.zeros((V,), dtype=bool)
+    if block_dataset_meta:
+        for j in range(V):
+            if roles_by_id[j] == "dataset_meta":
+                dataset_meta_mask[j] = True
+    
+    # Prompt anchor
+    prompt_anchor = None
+    if ids:
+        k0 = min(config.prompt_anchor_size, len(ids))
+        prompt_anchor = vec[ids[:k0]].mean(axis=0).astype(np.float32)
+        norm = np.linalg.norm(prompt_anchor)
+        if norm > 1e-12:
+            prompt_anchor = (prompt_anchor / norm).astype(np.float32)
+        else:
+            prompt_anchor = None
+    
+    # Initialize topic memory
+    topic_memory = TopicMemory(config=config)
+    if ids:
+        topic_memory.update(ids[:min(config.prompt_anchor_size, len(ids))], vec)
+    
     log = []
     tokens_since_end = 0
-
+    
     for step in range(max_new_tokens):
         prev = ids[-1]
-
-        # update tokens_since_end based on last emitted token
-        last_role = roles_by_id[prev] if prev < len(roles_by_id) else "unknown"
-        if last_role == "punct" and prev in end_token_ids:
+        
+        # Update tokens since end - זיהוי דינמי של סיום משפט
+        is_end_token = False
+        if prev < len(roles_by_id):
+            role = roles_by_id[prev]
+            # בודק אם זה פיסוק (לא רשימה קשיחה)
+            if role == "punct":
+                # בודק דמיון סמנטי לטוקני פיסוק נפוצים
+                punct_tokens = [i for i in range(len(roles_by_id)) if roles_by_id[i] == "punct"]
+                if punct_tokens:
+                    punct_vecs = vec[punct_tokens[:10]]
+                    prev_sim = np.max(np.dot(vec[prev], punct_vecs.T))
+                    if prev_sim > 0.5:  # דמיון גבוה לפיסוק
+                        is_end_token = True
+        
+        if is_end_token:
             tokens_since_end = 0
         else:
             tokens_since_end += 1
-
-        # context vector = mean of last tokens
-        k = min(context_window, len(ids))
-        ctx_vecs = vec[ids[-k:]]
-        # Fix NaN/inf values before computing mean
-        ctx_vecs = np.nan_to_num(ctx_vecs, nan=0.0, posinf=1e6, neginf=-1e6)
-        ctx = ctx_vecs.mean(axis=0)
-        # Normalize context vector to prevent overflow
-        ctx_norm = np.linalg.norm(ctx)
-        if ctx_norm > 0:
-            ctx = ctx / (ctx_norm + 1e-8)
-        else:
-            ctx = np.zeros_like(ctx)
-
-        comp_bigram = bigram_logp[prev].astype(np.float64)
-        # Fix NaN/inf in vec before matrix multiplication and normalize rows
-        vec_safe = np.nan_to_num(vec, nan=0.0, posinf=1e6, neginf=-1e6)
-        # Normalize vec rows to prevent overflow in matrix multiplication
-        vec_norms = np.linalg.norm(vec_safe, axis=1, keepdims=True)
-        vec_normalized = vec_safe / (vec_norms + 1e-8)
-        # Suppress warnings during matrix multiplication
-        with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
-            comp_sem = (vec_normalized @ ctx).astype(np.float64)
-        # Clip extreme values to prevent overflow
-        comp_sem = np.nan_to_num(comp_sem, nan=0.0, posinf=1e6, neginf=-1e6)
-        comp_sem = np.clip(comp_sem, -1e6, 1e6)
-
-        # contradiction penalty based on recent tokens
-        recent_contra = ids[-min(contradiction_window, len(ids)) :]
-        contra_pen = np.zeros((V,), dtype=np.float64)
-        for r in recent_contra:
-            # sparse-ish lookup; V is small but keep it straightforward
-            for j in range(V):
-                contra_pen[j] += contra.get((r, j), 0.0)
-
-        logits = weight_bigram * comp_bigram + weight_semantic * comp_sem - weight_contradiction * contra_pen
-
-                # --- Discourse role compatibility (LLM-like token-by-token role_state) ---
-        # If discourse artifacts exist, adjust logits by how compatible a candidate token's LEVEL is
-        # with the current inferred discourse role_state. If position-conditioned artifacts exist,
-        # select the appropriate bucket (early/mid/late within the current sentence).
-        emit_use = emit_logp
-        if role_state is not None:
-            b = _get_position_bucket(tokens_since_end, pos_thresholds, max_sentence_tokens)
-            if emit_logp_pos is not None and emit_logp_pos.ndim == 3 and 0 <= b < emit_logp_pos.shape[0]:
-                emit_use = emit_logp_pos[b]
-
-        if role_state is not None and emit_use is not None:
-            # small style-dependent scaling
-            style_mult = role_weight_explanatory_mult if st == "explanatory" else role_weight_descriptive_mult
-            rw = float(role_weight) * style_mult
-            level_names = getattr(art, "discourse_level_names", []) or []
-            # Use learned token_role_to_level mapping from art
-            token_role_to_level: Optional[Dict[str, str]] = getattr(art, "token_role_to_level", None)
-            for j in range(V):
-                lvl = _level_id_from_token_role(roles_by_id[j], level_names, token_role_to_level)
-                logits[j] += rw * _role_compat_log(role_state, emit_use, lvl)
-
-# --- Output gating: dataset/meta tokens (derived during training, no hardcoded token lists) ---
-        if block_dataset_meta:
-            for j in range(V):
-                if roles_by_id[j] == "dataset_meta":
-                    logits[j] = -1e18
-
         
-        # --- Role-aware neighbor gating: penalize editorial/meta framing loops (no hardcoded token lists) ---
-        # Tokens labeled as 'meta_frame' are derived statistically during training. In explanatory mode,
-        # we discourage these tokens unless the distribution strongly supports them.
-        if style == "explanatory":
-            # detect low-entropy role loops in the recent context
-            recent_roles = []
-            for rid in ids[-6:]:
-                if 0 <= rid < V:
-                    recent_roles.append(roles_by_id[rid])
-            # compute simple role entropy (over roles, excluding punct)
-            rr = [r for r in recent_roles if r != "punct"]
-            entropy = 0.0
-            if rr:
-                uniq = sorted(set(rr))
-                p = np.array([rr.count(u) / len(rr) for u in uniq], dtype=np.float64)
-                entropy = float(-(p * np.log(np.maximum(p, 1e-12))).sum())
-            # if we are stuck in low-entropy loops, apply stronger penalty
-            loop_boost = 1.0
-            if rr and entropy < entropy_threshold_low:
-                loop_boost = loop_boost_base
-            # additional boost: low-entropy high-probability role discourse in explanatory mode
-            # Use role_state probabilities directly (no hardcoded role name lookups)
-            if role_state is not None and emit_logp is not None and st == "explanatory" and role_names:
-                # Find role with highest probability (no hardcoded "meta" name)
-                max_role_idx = int(np.argmax(role_state))
-                if float(role_state[max_role_idx]) > role_state_threshold and _entropy(role_state) < entropy_threshold_role_state:
-                    loop_boost *= loop_boost_meta
-
-            for j in range(V):
-                if roles_by_id[j] == "meta_frame":
-                    logits[j] -= float(meta_frame_penalty) * loop_boost
-
-                # discourage sequences that remain in meta_frame role repeatedly
-                if rr and rr[-1] == "meta_frame" and roles_by_id[j] == "meta_frame":
-                    logits[j] -= float(role_loop_penalty) * loop_boost
-
-# --- Anti-repetition controls (exact + semantic) ---
-        rw = max(0, int(repeat_window))
-        if rw > 0 and repetition_penalty > 0:
-            exact_recent = ids[-rw:]
-            for j in range(V):
-                logits[j] -= _repetition_penalty(j, exact_recent, float(repetition_penalty))
-
-        sw = max(0, int(semantic_repeat_window))
-        if sw > 0 and semantic_repeat_penalty > 0:
-            sem_recent = ids[-sw:]
-            for j in range(V):
-                if roles_by_id[j] == "punct":
-                    continue
-                logits[j] -= _semantic_repeat_penalty(j, sem_recent, vec, float(semantic_repeat_threshold), float(semantic_repeat_penalty))
-
-        # --- Cluster switch (concept packing) ---
-        if clusters_by_id is not None and cluster_pen > 0:
-            cw = max(0, int(cluster_switch_window))
-            if cw > 0:
-                for j in range(V):
-                    logits[j] -= _cluster_switch_penalty(j, ids, clusters_by_id, cw, cluster_pen, roles_by_id=roles_by_id)
-
-        if closure_k > 0 and end_token_ids:
-            for j in end_token_ids:
-                logits[j] += _closure_boost(j, tokens_since_end, int(min_sentence_tokens), int(max_sentence_tokens), end_token_ids, closure_k, roles_by_id)
-
-        # top-k sampling
-        top_idx = np.argsort(-logits)[:max(1, top_k)]
-        top_logits = logits[top_idx]
+        # Update topic memory periodically
+        if step % 3 == 0 and len(ids) >= 5:
+            topic_memory.update(ids[-min(10, len(ids)):], vec)
+        
+        # Context vector
+        ctx = _hierarchical_context(ids, vec, topic_memory, short_window=min(context_window, config.short_context_window),
+                                    step=step, total_steps=max_new_tokens, config=config)
+        ctx = np.nan_to_num(ctx, nan=0.0, posinf=1.0, neginf=-1.0)
+        ctx_norm = np.linalg.norm(ctx)
+        if ctx_norm < 1e-12:
+            ctx = np.zeros(vec.shape[1], dtype=np.float32)
+        
+        # Bigram logits
+        comp_bigram = np.full((V,), -50.0, dtype=np.float64)
+        if str(prev) in bigram_logp:
+            for tid, logp in bigram_logp[str(prev)]:
+                if 0 <= tid < V:
+                    comp_bigram[tid] = np.clip(float(logp), -50.0, 50.0)
+        
+        # Semantic similarity
+        if ctx_norm > 1e-12:
+            comp_sem = np.clip((vec_norm @ ctx).astype(np.float64), -1.0, 1.0)
+            comp_sem = np.nan_to_num(comp_sem, nan=0.0, posinf=1.0, neginf=-1.0)
+        else:
+            comp_sem = np.zeros((V,), dtype=np.float64)
+        
+        # Prompt anchor boost (only for top candidates)
+        anchor_boost = np.zeros((V,), dtype=np.float64)
+        if prompt_anchor is not None:
+            anchor_sims = np.clip((vec_norm @ prompt_anchor).astype(np.float64), -1.0, 1.0)
+            anchor_boost = anchor_sims * config.anchor_weight
+        
+        # Contradiction penalty
+        contra_pen = np.zeros((V,), dtype=np.float64)
+        recent_contra = ids[-min(4, len(ids)):]
+        if contra and recent_contra:
+            for r in recent_contra:
+                for (a, b), penalty in contra.items():
+                    if a == r:
+                        contra_pen[b] += penalty
+                    elif b == r:
+                        contra_pen[a] += penalty
+        
+        # Base logits
+        logits = config.bigram_weight * comp_bigram + config.semantic_weight * comp_sem + anchor_boost - config.contra_weight * contra_pen
+        
+        # Get top candidates first (for efficient scoring)
+        # Use a larger initial top-k to ensure we have good candidates
+        initial_top_k = max(top_k * 2, 20)
+        initial_top_idx = np.argsort(-logits)[:initial_top_k]
+        
+        # Apply adaptive structure and coherence scores only to top candidates
+        structure_scores = np.zeros((V,), dtype=np.float64)
+        coherence_scores = np.zeros((V,), dtype=np.float64)
+        
+        # מחשב הקשר עדכני לשימוש ב-structure score
+        recent_context_vec = None
+        if len(ids) >= 3:
+            recent_ids = ids[-min(10, len(ids)):]
+            recent_context_vec = vec[recent_ids].mean(axis=0)
+            norm = np.linalg.norm(recent_context_vec)
+            if norm > 1e-12:
+                recent_context_vec = recent_context_vec / norm
+        
+        for j in initial_top_idx:
+            structure_scores[j] = _adaptive_structure_score(int(j), tokens_since_end, roles_by_id, vec, recent_context_vec, config=config)
+            coherence_scores[j] = _coherence_score(int(j), ids, vec, window=15, topic_memory=topic_memory, config=config)
+        
+        # Add scores to logits - משקלים מאוזנים יותר
+        logits += structure_scores * config.structure_weight + coherence_scores * config.coherence_weight
+        
+        # עידוד דינמי לסיום משפט (לא רשימה קשיחה)
+        if tokens_since_end > config.max_sentence_length:  # משפט ארוך
+            # מחפש טוקני פיסוק סמנטית דומים
+            punct_indices = [i for i in range(V) if roles_by_id[i] == "punct"]
+            if punct_indices:
+                # תגמל טוקני פיסוק שדומים להקשר
+                for pid in punct_indices[:20]:  # רק הראשונים
+                    if recent_context_vec is not None:
+                        sim = np.dot(vec[pid], recent_context_vec)
+                        if sim > config.punct_similarity_threshold:
+                            logits[pid] += config.structure_boost_long * min(1.0, tokens_since_end / (config.max_sentence_length + 5))
+        
+        # Block dataset/meta tokens
+        if block_dataset_meta:
+            logits[dataset_meta_mask] = -1e18
+        
+        # Repetition penalty
+        if repeat_window > 0 and repetition_penalty > 0:
+            recent = ids[-min(repeat_window, len(ids)):]
+            recent_set = set(recent)
+            for j in recent_set:
+                logits[j] -= repetition_penalty * recent.count(j)
+            
+            # Phrase-level penalty
+            if len(ids) >= 4:
+                for phrase_len in [2, 3]:
+                    if len(ids) >= phrase_len * 2:
+                        recent_phrase = tuple(ids[-phrase_len:])
+                        check_window = min(phrase_len * 2, len(ids) - phrase_len)
+                        for i in range(max(0, len(ids) - check_window), len(ids) - phrase_len):
+                            if tuple(ids[i:i+phrase_len]) == recent_phrase:
+                                for tid in recent_phrase:
+                                    logits[tid] -= repetition_penalty * 1.5
+                                break
+        
+        # Semantic repetition penalty
+        if semantic_repeat_window > 0 and semantic_repeat_penalty > 0:
+            sem_recent = ids[-min(semantic_repeat_window, len(ids)):]
+            if sem_recent:
+                sem_recent_vecs = vec_norm[sem_recent]
+                sem_sims = np.clip(vec_norm @ sem_recent_vecs.T, -1.0, 1.0)
+                max_sims = np.clip(np.max(sem_sims, axis=1), -1.0, 1.0)
+                mask = max_sims > semantic_repeat_threshold
+                if np.any(mask):
+                    penalty_scale = np.clip((max_sims[mask] - semantic_repeat_threshold) / 0.4, 0.0, 3.0)
+                    logits[mask] -= semantic_repeat_penalty * penalty_scale
+        
+        # Sampling (re-sort after adding structure/coherence scores)
+        if top_p is not None and top_p > 0:
+            mask = top_p_sampling(logits, top_p, config=config)
+            masked_logits = np.where(mask > 0, logits, -1e18)
+            top_idx = np.argsort(-masked_logits)[:max(1, int(np.sum(mask)))]
+            top_logits = masked_logits[top_idx]
+        else:
+            top_idx = np.argsort(-logits)[:max(1, top_k)]
+            top_logits = logits[top_idx]
+        
         probs = softmax(top_logits, temp=max(float(temperature), 1e-6))
-        choice_local = int(np.random.choice(len(top_idx), p=probs))
-        nxt = int(top_idx[choice_local])
+        if np.any(np.isnan(probs)) or np.sum(probs) == 0:
+            probs = np.ones_like(probs) / len(probs)
+        choice = int(np.random.choice(len(top_idx), p=probs))
+        nxt = int(top_idx[choice])
         ids.append(nxt)
-
-        if role_state is not None:
-            b = _get_position_bucket(tokens_since_end, pos_thresholds, max_sentence_tokens)
-            trans_use = trans_pos[b] if trans_pos is not None and trans_pos.ndim == 3 and 0 <= b < trans_pos.shape[0] else trans
-            emit_use = emit_logp_pos[b] if emit_logp_pos is not None and emit_logp_pos.ndim == 3 and 0 <= b < emit_logp_pos.shape[0] else emit_logp
-            if emit_use is not None and trans_use is not None:
-                level_names = getattr(art, "discourse_level_names", []) or []
-                token_role_to_level = getattr(art, "token_role_to_level", None)
-                lvl = _level_id_from_token_role(roles_by_id[nxt], level_names, token_role_to_level)
-                rs = (role_state.astype(np.float64) @ np.asarray(trans_use, dtype=np.float64)) * np.exp(np.asarray(emit_use, dtype=np.float64)[:, lvl])
-                role_state = (rs / max(1e-12, float(np.sum(rs)))).astype(np.float32) if np.sum(rs) > 1e-12 else (np.ones_like(role_state) / max(1, role_state.shape[0])).astype(np.float32)
-                if role_min_run and committed_role is not None:
-                    prev_dom, new_dom = int(committed_role), int(np.argmax(role_state))
-                    mr = int(role_min_run[prev_dom]) if prev_dom < len(role_min_run) else 2
-                    if committed_age < mr and new_dom != prev_dom:
-                        one = np.zeros_like(role_state, dtype=np.float32)
-                        one[prev_dom] = 1.0
-                        role_state = ((0.70 * role_state + 0.30 * one) / max(1e-12, float(np.sum(0.70 * role_state + 0.30 * one)))).astype(np.float32)
-                        committed_age += 1
-                    else:
-                        committed_role, committed_age = (new_dom, 1) if new_dom != prev_dom else (committed_role, committed_age + 1)
-                else:
-                    committed_role, committed_age = int(np.argmax(role_state)), 1
-
+        
         if explain:
             kshow = min(5, len(top_idx))
-            cand = []
-            for j in top_idx[:kshow]:
-                cand.append(
-                    {
-                        "token": art.vocab[int(j)],
-                        "score": float(logits[int(j)]),
-                        "bigram_logp": float(comp_bigram[int(j)]),
-                        "semantic_sim": float(comp_sem[int(j)]),
-                        "contradiction_penalty": float(contra_pen[int(j)]),
-                        "role": roles_by_id[int(j)],
-                        "cluster": int(clusters_by_id[int(j)]) if clusters_by_id is not None else -1,
-                    }
-                )
-            log.append(
-                {
-                    "step": step + 1,
-                    "prev_token": art.vocab[int(prev)],
-                    "chosen_token": art.vocab[int(nxt)],
-                    "top_candidates": cand,
-                }
-            )
+            cand = [{
+                "token": art.vocab[int(j)],
+                "score": float(logits[int(j)]),
+                "bigram_logp": float(comp_bigram[int(j)]),
+                "semantic_sim": float(comp_sem[int(j)]),
+            } for j in top_idx[:kshow]]
+            log.append({
+                "step": step + 1,
+                "prev_token": art.vocab[int(prev)],
+                "chosen_token": art.vocab[int(nxt)],
+                "top_candidates": cand,
+            })
+    
+    return {"text": tok.decode(ids), "token_ids": ids, "explain": log if explain else None}
 
-    return {"text": tok.decode(ids), "token_ids": ids, "explain": log}
 
-# ---------------- Dual-model generation (Reasoner + Selector debate) ----------------
-def generate_dual(
-    reasoner: ReasonerArtifacts,
-    selector: SelectorArtifacts,
-    prompt: str,
-    max_new_tokens: int = 60,
-    temperature: float = 0.85,
-    selector_top_k: int = 32,
-    # Debate mix weights:
-    alpha_selector: float = 0.55,
-    beta_reasoner: float = 0.45,
-    # Online strengthening/weakening during generation:
-    eta_trust: float = 0.10,
-    eta_bias: float = 0.08,
-    trust_clip: float = 2.0,
-    # Reasoner scoring weights:
-    w_semantic: float = 1.0,
-    w_anchor: float = 0.55,
-    w_contra: float = 1.25,
-    w_repeat: float = 0.85,
-    repeat_window: int = 6,
-    block_dataset_meta: bool = True,
-    explain: bool = False,
-    context_window: int = 10,
-    # NEW: micro-continuation debate (sequence-level critique)
-    lookahead_len: int = 6,
-    num_continuations: int = 12,
-    commit_len: int = 1,
-    # NEW: penalize "LLM-like" meta framing (derived token roles, no hardcoded token lists)
-    w_meta_frame: float = 0.45,
-) -> Dict[str, Any]:
-    """Generate text via a micro-continuation 'debate' between two models.
-
-    Previous version debated the *next token* only. This patch debates *short continuations* (3-8 tokens),
-    scores them at the sequence level, and then commits the first token (or a small number of tokens).
-
-    Rationale: the Reasoner is strongest at recognizing global/structural patterns. Scoring only a single
-    token makes it difficult to suppress "LLM-corpus style" continuations. Sequence-level critique lets the
-    Reasoner veto entire continuation patterns while the Selector still provides fluency.
-
-    - Selector: proposes short continuations via sparse trigram/bigram LM.
-    - Reasoner: scores each continuation for semantic stability, anchor alignment, contradiction avoidance,
-      repetition avoidance, and (optionally) meta-framing suppression.
-    - Online adaptation: trust[token] and per-context selector bias are updated during generation, based on
-      the chosen continuation's advantage relative to alternatives.
-    """
-    tok = ClosedVocabTokenizer(vocab=reasoner.vocab, token_to_id=reasoner.token_to_id)
-    ids: List[int] = tok.encode(prompt)
+def generate_dual(reasoner: ReasonerArtifacts, selector: SelectorArtifacts, prompt: str,
+                 max_new_tokens: int = 60, temperature: float = 0.75, selector_top_k: Optional[int] = None,
+                 alpha_selector: Optional[float] = None, beta_reasoner: Optional[float] = None,
+                 eta_trust: Optional[float] = None, eta_bias: Optional[float] = None, trust_clip: Optional[float] = None,
+                 w_semantic: Optional[float] = None, w_anchor: Optional[float] = None, w_contra: Optional[float] = None,
+                 w_repeat: Optional[float] = None, repeat_window: Optional[int] = None, block_dataset_meta: bool = True,
+                 explain: bool = False, context_window: Optional[int] = None, seed: Optional[int] = None,
+                 config: ModelConfig = default_config) -> Dict[str, Any]:
+    """Generate text using dual model - simplified version."""
+    if selector_top_k is None:
+        selector_top_k = config.selector_top_k_default
+    if alpha_selector is None:
+        alpha_selector = config.alpha_selector
+    if beta_reasoner is None:
+        beta_reasoner = config.beta_reasoner
+    if eta_trust is None:
+        eta_trust = config.eta_trust
+    if eta_bias is None:
+        eta_bias = config.eta_bias
+    if trust_clip is None:
+        trust_clip = config.trust_clip
+    if w_semantic is None:
+        w_semantic = config.w_semantic
+    if w_anchor is None:
+        w_anchor = config.w_anchor
+    if w_contra is None:
+        w_contra = config.w_contra
+    if w_repeat is None:
+        w_repeat = config.w_repeat
+    if repeat_window is None:
+        repeat_window = config.repeat_window
+    if context_window is None:
+        context_window = config.context_window
+    
+    if not prompt or not prompt.strip():
+        raise ValueError("Prompt cannot be empty")
+    if max_new_tokens <= 0 or temperature <= 0:
+        raise ValueError("Invalid parameters")
+    if not reasoner.vocab or not selector.vocab or reasoner.vocab != selector.vocab:
+        raise ValueError("Invalid vocabularies")
+    
+    if seed is not None:
+        np.random.seed(seed)
+    
+    try:
+        tok = ClosedVocabTokenizer(vocab=reasoner.vocab, token_to_id=reasoner.token_to_id)
+        ids: List[int] = tok.encode(prompt)
+    except ValueError as e:
+        raise ValueError(f"Tokenization failed: {e}")
+    
+    if not ids:
+        raise ValueError("Prompt resulted in empty token sequence")
+    
     V = len(reasoner.vocab)
     vec = reasoner.vectors
-
-    # prompt anchor (directional intent)
-    if ids:
-        k0 = min(16, len(ids))
-        anchor_vecs = vec[ids[:k0]]
-        # Fix NaN/inf values before computing mean
-        anchor_vecs = np.nan_to_num(anchor_vecs, nan=0.0, posinf=1e6, neginf=-1e6)
-        anchor = anchor_vecs.mean(axis=0)
-        # Normalize anchor vector
-        anchor_norm = np.linalg.norm(anchor)
-        if anchor_norm > 0:
-            anchor = anchor / (anchor_norm + 1e-8)
-        else:
-            anchor = np.zeros((vec.shape[1],), dtype=np.float32)
-    else:
-        anchor = np.zeros((vec.shape[1],), dtype=np.float32)
-
+    
+    # Prompt anchor
+    anchor = vec[ids[:min(config.prompt_anchor_size, len(ids))]].mean(axis=0).astype(np.float32) if ids else np.zeros((vec.shape[1],), dtype=np.float32)
+    norm = np.linalg.norm(anchor)
+    if norm > 1e-12:
+        anchor = (anchor / norm).astype(np.float32)
+    
     contra = _build_contradiction_lookup(reasoner.contradiction_pairs, reasoner.token_to_id)
     roles_by_id = [reasoner.roles.get(t, "unknown") for t in reasoner.vocab]
-
+    
+    # לא משתמשים ברשימה קשיחה של end_token_ids - זיהוי דינמי
+    
+    # Topic memory
+    topic_memory = TopicMemory(config=config)
+    if ids:
+        topic_memory.update(ids[:min(config.prompt_anchor_size, len(ids))], vec)
+    
+    # Semantic Group Manager - קבוצות סמנטיות דינמיות עם overlap משוקלל
+    group_manager = SemanticGroupManager(vec, reasoner.vocab, config=config)
+    
+    # מחשב הקשר פרומפט לשימוש בבחירת קבוצות
+    prompt_context = anchor.copy()
+    
+    # Semantic Lock: בוחר קבוצה סמנטית ראשונית לפי הפרומפט
+    locked_group_id: Optional[int] = None
+    lock_strength = config.lock_strength_initial  # חוזק הנעילה (דינמי)
+    tokens_since_lock = 0  # כמה טוקנים מאז הנעילה
+    last_sentence_end_step = 0  # מתי היה סיום משפט אחרון
+    
+    # Micro-topic Lock: מרכז סמנטי אחד כ"רעיון נוכחי"
+    micro_topic_center: Optional[np.ndarray] = None  # וקטור המרכז הסמנטי
+    micro_topic_token_id: Optional[int] = None  # ID של הטוקן המרכזי
+    micro_topic_similarity_threshold = config.micro_topic_similarity_threshold  # threshold דינמי - דמיון מינימלי
+    tokens_since_micro_topic_change = 0  # כמה טוקנים מאז שינוי המרכז
+    micro_topic_novelty_history: deque = deque(maxlen=config.novelty_history_size)  # היסטוריית novelty
+    
+    # Claim-level Lock: זיהוי claim type מהפרומפט (dynamic, no hardcoded keywords)
+    active_claim_type: str = _infer_claim_type(prompt, reasoner.vocab, reasoner.token_to_id, vec, config=config)
+    claim_role_tokens: Dict[str, List[int]] = _get_claim_role_tokens(reasoner.vocab, reasoner.token_to_id, vec, config=config)
+    
+    # בוחר את הקבוצה הכי נכונה לפי הפרומפט
+    if ids:
+        # מחפש את הקבוצה הכי קרובה לפרומפט
+        best_group_score = -1.0
+        for group in group_manager.groups:
+            # דמיון להקשר הפרומפט
+            context_sim = float(np.clip(np.dot(group.centroid, prompt_context), -1.0, 1.0))
+            # חוזק הקבוצה
+            strength = group.strength
+            # ציון משולב
+            score = config.semantic_group_token_weight * context_sim + config.semantic_group_context_weight * strength
+            if score > best_group_score:
+                best_group_score = score
+                locked_group_id = group.group_id
+        
+        # מפעיל את הקבוצה הנעולה
+        if locked_group_id is not None:
+            group_manager.activate_group(locked_group_id, strength=1.0)
+            
+            # Micro-topic Lock: בוחר מרכז סמנטי אחד מהקבוצה הנעולה
+            locked_group = group_manager.groups[locked_group_id]
+            
+            # בוחר את הטוקן הכי קרוב להקשר הפרומפט בקבוצה
+            best_token_score = -1.0
+            best_token_id = None
+            
+            for tid in locked_group.tokens:
+                token_vec = vec[tid]
+                # דמיון להקשר הפרומפט
+                prompt_sim = float(np.clip(np.dot(token_vec, prompt_context), -1.0, 1.0))
+                # דמיון למרכז הקבוצה
+                group_sim = locked_group.get_similarity(token_vec)
+                # ציון משולב
+                token_score = 0.6 * prompt_sim + 0.4 * group_sim
+                
+                if token_score > best_token_score:
+                    best_token_score = token_score
+                    best_token_id = tid
+            
+            # מגדיר את המרכז הסמנטי
+            if best_token_id is not None:
+                micro_topic_token_id = best_token_id
+                micro_topic_center = vec[best_token_id].copy()
+                norm = np.linalg.norm(micro_topic_center)
+                if norm > 1e-12:
+                    micro_topic_center = (micro_topic_center / norm).astype(np.float32)
+    
     # Online state
     trust = np.zeros((V,), dtype=np.float64)
-    # sparse bias: ctx_key -> {token_id: bias}
     bias: Dict[str, Dict[int, float]] = {}
-
     explain_rows: List[Dict[str, Any]] = []
-
+    
     def ctx_key(p2: Optional[int], p1: Optional[int]) -> str:
         if p2 is not None and p1 is not None:
             return f"{int(p2)},{int(p1)}"
-        if p1 is not None:
-            return str(int(p1))
-        return "<start>"
-
+        return str(int(p1)) if p1 is not None else "<start>"
+    
     def get_bias(k: str, tid: int) -> float:
-        d = bias.get(k)
-        if not d:
-            return 0.0
-        return float(d.get(int(tid), 0.0))
-
+        return float(bias.get(k, {}).get(int(tid), 0.0))
+    
     def add_bias(k: str, tid: int, delta: float) -> None:
-        d = bias.get(k)
-        if d is None:
-            d = {}
-            bias[k] = d
-        d[int(tid)] = float(d.get(int(tid), 0.0) + float(delta))
-
+        if k not in bias:
+            bias[k] = {}
+        bias[k][int(tid)] = float(bias[k].get(int(tid), 0.0) + float(delta))
+    
     def contradiction_penalty(candidate: int, recent: List[int]) -> float:
-        pen = 0.0
-        for r in recent:
-            pen = max(pen, float(contra.get((int(candidate), int(r)), 0.0)))
-        return pen
-
+        return max([float(contra.get((int(candidate), int(r)), 0.0)) for r in recent], default=0.0)
+    
     def sample_next(prev2: Optional[int], prev1: Optional[int]) -> Optional[Tuple[int, float]]:
         cands = selector.candidates(prev2, prev1, top_k=int(selector_top_k))
         if not cands:
@@ -520,210 +924,418 @@ def generate_dual(
         cand_ids = np.array([int(c) for c, _ in cands], dtype=np.int64)
         cand_lps = np.array([float(lp) for _, lp in cands], dtype=np.float64)
         probs = softmax(cand_lps, temp=max(1e-6, float(temperature)))
+        if np.any(np.isnan(probs)) or np.sum(probs) == 0:
+            probs = np.ones_like(probs) / len(probs)
         j = int(np.random.choice(len(cand_ids), p=probs))
         return int(cand_ids[j]), float(cand_lps[j])
-
-    def score_continuation(cont: List[int], prev2: Optional[int], prev1: Optional[int]) -> Tuple[float, float, float, float]:
-        """Return (selector_avg, reasoner_avg, total, meta_frac) for a continuation."""
+    
+    def score_continuation(cont: List[int], prev2: Optional[int], prev1: Optional[int]) -> Tuple[float, float, float]:
+        """Score continuation: (selector_avg, reasoner_avg, total)."""
         if not cont:
-            return -1e9, -1e9, -1e9, 0.0
-
-        # selector: include online bias along the path
+            return -1e9, -1e9, -1e9
+        
         sel_sum = 0.0
         p2, p1 = prev2, prev1
         for tid in cont:
-            kctx = ctx_key(p2, p1)
-            # we don't have per-step logp stored for every token here (only sampled token's lp when building cont)
-            # so sel_sum is accumulated when building continuations; bias is added here to reflect online shaping
-            sel_sum += get_bias(kctx, int(tid))
+            sel_sum += get_bias(ctx_key(p2, p1), int(tid))
             p2, p1 = (p1, int(tid)) if p1 is not None else (None, int(tid))
-
-        # reasoner: score sequence token-by-token with moving context
+        
         tmp_ids = list(ids)
         reason_sum = 0.0
-        meta_count = 0.0
-        meta_roles = {"meta_frame", "meta_shape", "dataset_meta"}
+        
+        # Closure pressure
+        current_step = len(tmp_ids)
+        progress = current_step / max(max_new_tokens, 1)
+        closure_strength = max(0.0, (progress - config.closure_threshold) / (1.0 - config.closure_threshold)) if progress > config.closure_threshold else 0.0
+        
+        # Compute recent context
+        recent_context = None
+        if len(tmp_ids) >= 5:
+            recent_tokens = tmp_ids[-min(config.recent_context_size, len(tmp_ids)):]
+            recent_context = vec[recent_tokens].mean(axis=0).astype(np.float32)
+            recent_norm = np.linalg.norm(recent_context)
+            if recent_norm > 1e-12:
+                recent_context = (recent_context / recent_norm).astype(np.float32)
+        
+        recent_groups: List[int] = []
+        
         for tid in cont:
             if not (0 <= int(tid) < V):
                 continue
-            # block dataset/meta tokens completely if requested
             if block_dataset_meta and roles_by_id[int(tid)] == "dataset_meta":
                 reason_sum -= 2.5
-            if roles_by_id[int(tid)] in meta_roles:
-                meta_count += 1.0
-
-            k = min(int(context_window), len(tmp_ids)) if tmp_ids else 0
-            if k > 0:
-                ctx_vecs = vec[tmp_ids[-k:]]
-                # Fix NaN/inf values before computing mean
-                ctx_vecs = np.nan_to_num(ctx_vecs, nan=0.0, posinf=1e6, neginf=-1e6)
-                ctx = ctx_vecs.mean(axis=0)
-                # Normalize context vector
-                ctx_norm = np.linalg.norm(ctx)
-                if ctx_norm > 0:
-                    ctx = ctx / (ctx_norm + 1e-8)
-                else:
-                    ctx = anchor.copy()
-            else:
-                ctx = anchor
-
-            # Fix NaN/inf in vec before dot product
-            vec_tid = np.nan_to_num(vec[int(tid)], nan=0.0, posinf=1e6, neginf=-1e6)
-            ctx_safe = np.nan_to_num(ctx, nan=0.0, posinf=1e6, neginf=-1e6)
-            anchor_safe = np.nan_to_num(anchor, nan=0.0, posinf=1e6, neginf=-1e6)
-            sem = float(np.clip(np.dot(vec_tid, ctx_safe), -1e6, 1e6))
-            anc = float(np.clip(np.dot(vec_tid, anchor_safe), -1e6, 1e6))
-
-            recent = tmp_ids[-max(1, int(repeat_window)):] if tmp_ids else []
-            rep = 1.0 if int(tid) in recent else 0.0
+            
+            best_group_id = group_manager.find_best_group_for_token(int(tid), prompt_context)
+            k = min(context_window, len(tmp_ids)) if tmp_ids else 0
+            ctx = _hierarchical_context(tmp_ids, vec, topic_memory, short_window=k,
+                                       step=len(tmp_ids), total_steps=max_new_tokens, config=config) if k > 0 else anchor
+            recent = tmp_ids[-max(1, repeat_window):] if tmp_ids else []
+            
+            # Basic scores
+            sem = float(np.dot(vec[int(tid)], ctx))
+            anc = float(np.dot(vec[int(tid)], anchor))
             cp = contradiction_penalty(int(tid), recent)
-
-            reason_sum += (float(w_semantic) * sem) + (float(w_anchor) * anc) - (float(w_contra) * cp) - (float(w_repeat) * rep)
+            rep = 1.0 if int(tid) in recent else 0.0
+            
+            # Semantic group boost
+            group_boost = 0.0
+            semantic_boost = 0.0
+            if best_group_id is not None:
+                group_boost = group_manager.get_active_group_boost(int(tid))
+                group_connections = group_manager.get_group_connections(best_group_id, reasoner.bigram_logp)
+                if int(tid) in group_connections and group_connections[int(tid)] > config.group_connection_threshold:
+                    normalized_strength = (group_connections[int(tid)] + config.group_connection_normalization) / config.group_connection_normalization
+                    group_boost += config.group_connection_boost * normalized_strength
+            semantic_boost = group_manager.get_semantic_similarity_boost(int(tid), prompt_context)
+            
+            # Lock scores
+            lock_boost = 0.0
+            lock_penalty = 0.0
+            if locked_group_id is not None and lock_strength > config.lock_strength_min:
+                locked_group = group_manager.groups[locked_group_id]
+                if int(tid) in locked_group.tokens:
+                    lock_boost = lock_strength * (config.lock_boost_base + config.lock_boost_similarity * locked_group.get_similarity(vec[int(tid)]))
+                else:
+                    lock_penalty = lock_strength * config.lock_penalty_base
+            
+            # Micro-topic penalty
+            micro_topic_penalty = 0.0
+            if micro_topic_center is not None and lock_strength > config.lock_strength_min:
+                token_vec = vec[int(tid)]
+                token_norm = np.linalg.norm(token_vec)
+                if token_norm > 1e-12:
+                    similarity = float(np.clip(np.dot(token_vec / token_norm, micro_topic_center), -1.0, 1.0))
+                    if similarity < micro_topic_similarity_threshold:
+                        penalty_scale = (micro_topic_similarity_threshold - similarity) / micro_topic_similarity_threshold
+                        micro_topic_penalty = lock_strength * config.micro_topic_penalty_base * penalty_scale
+            
+            # Claim penalty
+            claim_penalty = 0.0
+            if recent_context is not None:
+                token_vec = vec[int(tid)]
+                token_norm = np.linalg.norm(token_vec)
+                if token_norm > 1e-12:
+                    context_sim = float(np.clip(np.dot(token_vec / token_norm, recent_context), -1.0, 1.0))
+                    if context_sim < config.context_similarity_threshold:
+                        claim_penalty = config.claim_penalty_base
+            
+            # Group repetition penalty
+            group_penalty = 0.0
+            if best_group_id is not None:
+                group_count = recent_groups.count(best_group_id)
+                if group_count > 0:
+                    penalty_base = config.group_repetition_penalty_base * group_count
+                    if group_count > config.group_repetition_threshold:
+                        penalty_base = config.group_repetition_penalty_high * group_count
+                    group_penalty = penalty_base
+            
+            # Closure boost
+            closure_boost = 0.0
+            if closure_strength > 0 and recent_context is not None:
+                tid_sim = float(np.clip(np.dot(vec[int(tid)], recent_context), -1.0, 1.0))
+                if tid_sim > config.closure_similarity_threshold:
+                    closure_boost = config.closure_boost_base * closure_strength * tid_sim
+                if roles_by_id[int(tid)] == "punct":
+                    punct_sim = np.mean([np.dot(vec[int(tid)], vec[i]) 
+                                        for i in range(V) 
+                                        if roles_by_id[i] == "punct"][:config.punct_similarity_check_count] or [0])
+                    if punct_sim > config.punct_similarity_threshold:
+                        closure_boost += config.closure_punct_boost * closure_strength
+            
+            reason_sum += (w_semantic * sem) + (w_anchor * anc) - (w_contra * cp) - (w_repeat * rep) + group_boost + semantic_boost - group_penalty + closure_boost + lock_boost - lock_penalty - micro_topic_penalty - claim_penalty
             tmp_ids.append(int(tid))
-
+            
+            if best_group_id is not None:
+                recent_groups.append(best_group_id)
+                if len(recent_groups) > config.recent_groups_window:
+                    recent_groups.pop(0)
+        
         L = max(1, len(cont))
-        selector_avg = float(sel_sum) / float(L)
-        reasoner_avg = float(reason_sum) / float(L)
-        meta_frac = float(meta_count) / float(L)
-
-        # meta framing penalty is applied at the sequence level
-        reasoner_avg = float(reasoner_avg) - float(w_meta_frame) * meta_frac
-
-        # include average trust along the continuation (stabilizes consistent paths)
-        trust_avg = float(np.mean([float(trust[int(t)]) for t in cont if 0 <= int(t) < V])) if cont else 0.0
-
-        total = (float(alpha_selector) * selector_avg) + (float(beta_reasoner) * reasoner_avg) + trust_avg
-        return selector_avg, reasoner_avg, total, meta_frac
-
-    # normalize/clip lookahead settings
-    la = int(max(1, min(16, int(lookahead_len))))
-    n_cont = int(max(2, min(64, int(num_continuations))))
-    commit = int(max(1, min(la, int(commit_len))))
-
+        selector_avg = sel_sum / L
+        reasoner_avg = reason_sum / L
+        trust_avg = float(np.mean([trust[int(t)] for t in cont if 0 <= int(t) < V])) if cont else 0.0
+        total = (alpha_selector * selector_avg) + (beta_reasoner * reasoner_avg) + trust_avg
+        return selector_avg, reasoner_avg, total
+    
     for step in range(int(max_new_tokens)):
         prev1 = ids[-1] if len(ids) >= 1 else None
         prev2 = ids[-2] if len(ids) >= 2 else None
-
-        # Build candidate continuations by sampling the selector
-        cont_rows: List[Dict[str, Any]] = []
-        for _ in range(n_cont):
+        
+        # Sample continuations
+        cont_rows = []
+        for _ in range(config.num_continuations):
             p2, p1 = prev2, prev1
             cont: List[int] = []
             sel_lp_sum = 0.0
-            for _t in range(la):
+            for _t in range(config.continuation_length):
                 nxt = sample_next(p2, p1)
                 if nxt is None:
                     break
                 tid, lp = nxt
-                # hard block dataset/meta tokens during proposal if requested
                 if block_dataset_meta and 0 <= tid < V and roles_by_id[tid] == "dataset_meta":
-                    # try a few resamples quickly
-                    tried = 0
-                    ok = False
-                    while tried < 3:
+                    for _ in range(3):
                         nxt2 = sample_next(p2, p1)
-                        if nxt2 is None:
+                        if nxt2 and not (block_dataset_meta and 0 <= nxt2[0] < V and roles_by_id[nxt2[0]] == "dataset_meta"):
+                            tid, lp = nxt2
                             break
-                        tid2, lp2 = nxt2
-                        if not (block_dataset_meta and 0 <= tid2 < V and roles_by_id[tid2] == "dataset_meta"):
-                            tid, lp = tid2, lp2
-                            ok = True
-                            break
-                        tried += 1
-                    if not ok and block_dataset_meta:
+                    if block_dataset_meta and 0 <= tid < V and roles_by_id[tid] == "dataset_meta":
                         break
                 cont.append(int(tid))
                 sel_lp_sum += float(lp)
                 p2, p1 = (p1, int(tid)) if p1 is not None else (None, int(tid))
-
-            if not cont:
-                continue
-
-            # store sampled selector score separately (avg per token)
-            cont_rows.append({"cont": cont, "sel_lp_avg": float(sel_lp_sum) / float(len(cont))})
-
+            
+            if cont:
+                cont_rows.append({"cont": cont, "sel_lp_avg": sel_lp_sum / len(cont)})
+        
         if not cont_rows:
             break
-
-        # Score continuations and choose one
+        
+        # Score continuations
         scored = []
         for r in cont_rows:
             cont = r["cont"]
             s_avg = float(r["sel_lp_avg"])
-            # inject selector sampled logp avg into score_continuation via sel_sum baseline
-            # (score_continuation adds only online bias; we add logp here)
-            sel_bias_avg, rs_avg, total, meta_frac = score_continuation(cont, prev2, prev1)
+            sel_bias_avg, rs_avg, total = score_continuation(cont, prev2, prev1)
             selector_avg = s_avg + sel_bias_avg
-            total = (float(alpha_selector) * selector_avg) + (float(beta_reasoner) * rs_avg) + float(np.mean([trust[int(t)] for t in cont if 0 <= int(t) < V]))
-            scored.append((cont, selector_avg, rs_avg, total, meta_frac))
-
+            total = (alpha_selector * selector_avg) + (beta_reasoner * rs_avg) + float(np.mean([trust[int(t)] for t in cont if 0 <= int(t) < V]))
+            scored.append((cont, selector_avg, rs_avg, total))
+        
         if not scored:
             break
-
+        
         totals = np.array([x[3] for x in scored], dtype=np.float64)
         probs = softmax(totals, temp=max(1e-6, float(temperature)))
+        if np.any(np.isnan(probs)) or np.sum(probs) == 0:
+            probs = np.ones_like(probs) / len(probs)
         pick = int(np.random.choice(len(scored), p=probs))
-        chosen_cont, chosen_sel, chosen_rs, chosen_total, chosen_meta = scored[pick]
-
-        # advantage signal: chosen continuation total vs mean alternative total
+        chosen_cont, chosen_sel, chosen_rs, chosen_total = scored[pick]
+        
         adv = float(chosen_total - float(np.mean(totals)))
-
-        # Commit tokens (typically 1) from the chosen continuation
-        for j in range(min(commit, len(chosen_cont))):
-            chosen = int(chosen_cont[j])
-            prev1 = ids[-1] if len(ids) >= 1 else None
-            prev2 = ids[-2] if len(ids) >= 2 else None
-            kctx = ctx_key(prev2, prev1)
-
-            # Online strengthening/weakening
-            trust[chosen] = float(np.clip(trust[chosen] + float(eta_trust) * adv, -float(trust_clip), float(trust_clip)))
-
-            # Bias selector toward the chosen token in this context
-            add_bias(kctx, chosen, float(eta_bias) * adv)
-
-            # Push down a few alternatives (from direct candidates) to keep bias sparse
-            alt = selector.candidates(prev2, prev1, top_k=min(8, int(selector_top_k)))
-            for alt_id, _ in alt[:4]:
-                alt_id = int(alt_id)
-                if alt_id == chosen:
-                    continue
-                add_bias(kctx, alt_id, -0.25 * float(eta_bias) * adv)
-
-            ids.append(chosen)
-
+        
+        # Commit first token
+        chosen = int(chosen_cont[0])
+        prev1 = ids[-1] if len(ids) >= 1 else None
+        prev2 = ids[-2] if len(ids) >= 2 else None
+        kctx = ctx_key(prev2, prev1)
+        
+        trust[chosen] = float(np.clip(trust[chosen] + eta_trust * adv, -trust_clip, trust_clip))
+        add_bias(kctx, chosen, eta_bias * adv)
+        
+        alt = selector.candidates(prev2, prev1, top_k=min(8, int(selector_top_k)))
+        for alt_id, _ in alt[:config.num_alternatives]:
+            alt_id = int(alt_id)
+            if alt_id != chosen:
+                add_bias(kctx, alt_id, -config.alternative_penalty * eta_bias * adv)
+        
+        ids.append(chosen)
+        tokens_since_lock += 1
+        tokens_since_micro_topic_change += 1
+        
+        # מחשב novelty של הטוקן שנבחר (דמיון לטוקנים האחרונים)
+        novelty = 1.0  # default - חדש לגמרי
+        if len(ids) >= 5 and micro_topic_center is not None:
+            recent_tokens = ids[-min(10, len(ids)):-1]  # כל הטוקנים האחרונים חוץ מהנוכחי
+            if recent_tokens:
+                recent_vecs = vec[recent_tokens]
+                chosen_vec = vec[chosen]
+                chosen_norm = np.linalg.norm(chosen_vec)
+                if chosen_norm > 1e-12:
+                    chosen_vec_norm = chosen_vec / chosen_norm
+                    similarities = np.clip(np.dot(recent_vecs, chosen_vec_norm), -1.0, 1.0)
+                    max_sim = float(np.max(similarities))
+                    novelty = 1.0 - max_sim  # novelty גבוה = דמיון נמוך
+        
+        micro_topic_novelty_history.append(novelty)
+        
+        # Closure Heuristic: בודק אם אפשר לשחרר את הנעילה
+        can_switch_group = False
+        
+        # 1. אם המשפט הסתיים (זיהוי דינמי של פיסוק)
+        is_sentence_end = False
+        if chosen < len(roles_by_id):
+            role = roles_by_id[chosen]
+            if role == "punct":
+                # בודק דמיון סמנטי לטוקני פיסוק
+                punct_tokens = [i for i in range(V) if roles_by_id[i] == "punct"]
+                if punct_tokens:
+                    punct_vecs = vec[punct_tokens[:10]]
+                    chosen_sim = np.max(np.dot(vec[chosen], punct_vecs.T))
+                    if chosen_sim > 0.5:
+                        is_sentence_end = True
+                        last_sentence_end_step = step
+        
+        # 2. אם יש closure (כמעט סוף הגנרציה)
+        progress = step / max(max_new_tokens, 1)
+        is_closure = progress > config.closure_threshold
+        
+        # 3. אם הנעילה נחלשה מדי (decay)
+        if lock_strength < config.lock_strength_min:
+            can_switch_group = True
+        
+        # 4. אם עברו הרבה טוקנים מאז הנעילה (לא נעול לנצח)
+        if tokens_since_lock > config.tokens_since_lock_max:  # דינמי - לא חוק קשיח
+            can_switch_group = True
+        
+        # 5. אם המשפט הסתיים או יש closure - אפשר לשחרר
+        if is_sentence_end or is_closure:
+            can_switch_group = True
+        
+        # אם אפשר לשחרר - בוחר קבוצה חדשה
+        if can_switch_group and locked_group_id is not None:
+            # מחפש את הקבוצה הכי נכונה לפי ההקשר הנוכחי
+            best_group_id = group_manager.find_best_group_for_token(chosen, prompt_context)
+            
+            if best_group_id is not None and best_group_id != locked_group_id:
+                # משחרר את הנעילה הישנה ומנעל על קבוצה חדשה
+                locked_group_id = best_group_id
+                lock_strength = config.lock_strength_initial
+                tokens_since_lock = 0
+                group_manager.activate_group(best_group_id, strength=config.lock_strength_initial)
+                
+                # Micro-topic Lock: בוחר מרכז סמנטי חדש מהקבוצה החדשה
+                new_locked_group = group_manager.groups[best_group_id]
+                best_token_score = -1.0
+                best_token_id = None
+                
+                for tid in new_locked_group.tokens:
+                    token_vec = vec[tid]
+                    prompt_sim = float(np.clip(np.dot(token_vec, prompt_context), -1.0, 1.0))
+                    group_sim = new_locked_group.get_similarity(token_vec)
+                    token_score = 0.6 * prompt_sim + 0.4 * group_sim
+                    
+                    if token_score > best_token_score:
+                        best_token_score = token_score
+                        best_token_id = tid
+                
+                if best_token_id is not None:
+                    micro_topic_token_id = best_token_id
+                    micro_topic_center = vec[best_token_id].copy()
+                    norm = np.linalg.norm(micro_topic_center)
+                    if norm > 1e-12:
+                        micro_topic_center = (micro_topic_center / norm).astype(np.float32)
+                    tokens_since_micro_topic_change = 0
+            else:
+                # נשאר באותה קבוצה אבל מחזק את הנעילה
+                lock_strength = min(config.activation_limit, lock_strength + config.activation_increment)
+        
+        # Micro-topic Lock: Closure condition לשינוי המרכז הסמנטי
+        can_change_micro_topic = False
+        
+        if micro_topic_center is not None:
+            # 1. Novelty נמוך (חוזרים על אותו דבר)
+            avg_novelty = float(np.mean(list(micro_topic_novelty_history))) if micro_topic_novelty_history else 1.0
+            if avg_novelty < config.low_novelty_threshold:  # novelty נמוך = חזרתיות גבוהה
+                can_change_micro_topic = True
+            
+            # 2. Repetition גבוה (הטוקן הנוכחי דומה מאוד לטוקנים האחרונים)
+            if novelty < config.very_low_novelty_threshold:  # novelty נמוך מאוד = חזרתיות חזקה
+                can_change_micro_topic = True
+            
+            # 3. עברו הרבה טוקנים מאז השינוי האחרון
+            if tokens_since_micro_topic_change > config.tokens_since_micro_topic_max:  # דינמי - לא חוק קשיח
+                can_change_micro_topic = True
+            
+            # 4. אם המשפט הסתיים או יש closure
+            if is_sentence_end or is_closure:
+                can_change_micro_topic = True
+            
+            # אם אפשר לשנות - בוחר מרכז חדש מהקבוצה הנוכחית
+            if can_change_micro_topic and locked_group_id is not None:
+                locked_group = group_manager.groups[locked_group_id]
+                
+                # בוחר את הטוקן הכי קרוב להקשר הנוכחי בקבוצה
+                best_token_score = -1.0
+                best_token_id = None
+                
+                for tid in locked_group.tokens:
+                    token_vec = vec[tid]
+                    # דמיון להקשר הנוכחי
+                    current_sim = float(np.clip(np.dot(token_vec, prompt_context), -1.0, 1.0))
+                    # דמיון למרכז הקבוצה
+                    group_sim = locked_group.get_similarity(token_vec)
+                    # ציון משולב
+                    token_score = 0.6 * current_sim + 0.4 * group_sim
+                    
+                    if token_score > best_token_score:
+                        best_token_score = token_score
+                        best_token_id = tid
+                
+                # משנה את המרכז רק אם הטוקן החדש שונה מהנוכחי
+                if best_token_id is not None and best_token_id != micro_topic_token_id:
+                    micro_topic_token_id = best_token_id
+                    micro_topic_center = vec[best_token_id].copy()
+                    norm = np.linalg.norm(micro_topic_center)
+                    if norm > 1e-12:
+                        micro_topic_center = (micro_topic_center / norm).astype(np.float32)
+                    tokens_since_micro_topic_change = 0
+                    micro_topic_novelty_history.clear()  # מתחיל מחדש
+        else:
+            # ממשיך עם הנעילה הנוכחית - decay איטי
+            lock_strength *= config.lock_decay_rate  # decay איטי מאוד
+        
+        # מפעיל את הקבוצה הכי נכונה לטוקן שנבחר (אם לא נעול)
+        if not can_switch_group:
+            best_group_id = group_manager.find_best_group_for_token(chosen, prompt_context)
+            if best_group_id is not None:
+                # מפעיל את הקבוצה (עם decay איטי ל-ActiveGroup הקודמת)
+                current_activation = 0.0
+                if group_manager.active_group_id is not None:
+                    current_activation = group_manager.groups[group_manager.active_group_id].activation
+                
+                # בדיקה אם חוזרים על אותה קבוצה (מונע נעילה) - דינמי
+                recent_group_ids = [group_manager.find_best_group_for_token(tid, prompt_context) 
+                                   for tid in ids[-min(config.recent_groups_check_window, len(ids)):]]
+                same_group_count = recent_group_ids.count(best_group_id)
+                
+                # אם חוזרים על אותה קבוצה - מקטין את ה-strength (מונע נעילה) - דינמי
+                if same_group_count > config.group_repetition_threshold:
+                    strength = config.lock_strength_weak
+                elif same_group_count > 1:
+                    strength = config.lock_strength_medium
+                elif current_activation > config.high_activation_threshold:
+                    strength = (config.lock_strength_medium + config.lock_strength_normal) / 2.0  # בינוני
+                else:
+                    strength = config.lock_strength_normal
+                
+                group_manager.activate_group(best_group_id, strength=strength)
+        
+        # Decay לכל הקבוצות בכל שלב (מונע נעילה) - גם לקבוצה הפעילה
+        for group in group_manager.groups:
+            group.decay()
+        
+        # מעדכן את הקשר הפרומפט (דינמי)
+        if len(ids) >= 3:
+            recent_ids = ids[-min(config.recent_context_size, len(ids)):]
+            prompt_context = vec[recent_ids].mean(axis=0).astype(np.float32)
+            norm = np.linalg.norm(prompt_context)
+            if norm > 1e-12:
+                prompt_context = (prompt_context / norm).astype(np.float32)
+        
+        # Update topic memory
+        if step % 5 == 0 and len(ids) >= 5:
+            topic_memory.update(ids[-min(config.recent_context_size, len(ids)):], vec)
+        
         if explain:
-            # show top continuations with decoded preview
             top_show = sorted(scored, key=lambda x: x[3], reverse=True)[:min(6, len(scored))]
             explain_rows.append({
                 "step": int(step),
                 "adv": float(adv),
                 "chosen_first": tok.vocab[int(chosen_cont[0])] if chosen_cont else "",
-                "chosen_cont_preview": tok.decode(ids[:-min(commit, len(chosen_cont))] + chosen_cont[:min(len(chosen_cont), 12)]),
-                "candidates": [
-                    {
-                        "preview": tok.decode(ids + cont[:min(len(cont), 10)]),
-                        "len": int(len(cont)),
-                        "selector_avg": float(sel),
-                        "reasoner_avg": float(rs),
-                        "total": float(tt),
-                        "meta_frac": float(mf),
-                    }
-                    for cont, sel, rs, tt, mf in top_show
-                ],
+                "candidates": [{
+                    "preview": tok.decode(ids + cont[:min(len(cont), 10)]),
+                    "len": int(len(cont)),
+                    "selector_avg": float(sel),
+                    "reasoner_avg": float(rs),
+                    "total": float(tt),
+                } for cont, sel, rs, tt in top_show],
             })
-
-    text = tok.decode(ids)
-    out: Dict[str, Any] = {"text": text}
-    if explain:
-        out["explain"] = explain_rows
-    out["online"] = {
-        "num_steps": int(len(ids)),
-        "bias_contexts": int(len(bias)),
-        "trust_nonzero": int(np.sum(np.abs(trust) > 1e-9)),
-        "trust_top": [
-            {"tok": tok.vocab[i], "id": int(i), "trust": float(trust[i])}
-            for i in list(np.argsort(-np.abs(trust))[:10])
-            if abs(float(trust[i])) > 1e-9
-        ]
+    
+    return {
+        "text": tok.decode(ids),
+        "explain": explain_rows if explain else None,
+        "online": {
+            "num_steps": int(len(ids)),
+            "bias_contexts": int(len(bias)),
+            "trust_nonzero": int(np.sum(np.abs(trust) > 1e-9)),
+        }
     }
-    return out

@@ -1,21 +1,46 @@
+"""Utility functions."""
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import List
+
 
 def normalize_rows(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """
+    Normalize rows of matrix.
+    
+    Args:
+        x: Input matrix (N, D)
+        eps: Epsilon for numerical stability
+    
+    Returns:
+        Normalized matrix
+    """
+    if x.size == 0:
+        return x
     n = np.linalg.norm(x, axis=1, keepdims=True)
     return x / (n + eps)
 
-def cosine(a: np.ndarray, b: np.ndarray, eps: float=1e-8) -> float:
-    return float(a.dot(b) / ((np.linalg.norm(a)+eps)*(np.linalg.norm(b)+eps)))
 
 def softmax(logits: np.ndarray, temp: float = 1.0) -> np.ndarray:
+    """
+    Softmax with temperature.
+    
+    Args:
+        logits: Input logits array
+        temp: Temperature parameter
+    
+    Returns:
+        Probability distribution
+    """
+    if logits.size == 0:
+        return logits
+    if temp <= 0:
+        raise ValueError("Temperature must be positive")
     z = logits / max(temp, 1e-8)
     z = z - np.max(z)
-    e = np.exp(z)
-    return e / np.sum(e)
+    e = np.exp(np.clip(z, -500, 500))  # Clip to prevent overflow
+    s = np.sum(e)
+    if s == 0 or np.isnan(s) or np.isinf(s):
+        # Fallback to uniform
+        return np.ones_like(e) / len(e)
+    return e / s
 
-def topk_indices(x: np.ndarray, k: int) -> List[int]:
-    if k <= 0:
-        return []
-    k = min(k, x.shape[0])
-    return list(np.argpartition(-x, k-1)[:k])

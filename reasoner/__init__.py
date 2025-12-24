@@ -1,1 +1,4 @@
-"""Closed-vocabulary, explainable reasoner prototype."""
+"""Explainable token-reasoning engine with closed vocabulary."""
+
+
+
