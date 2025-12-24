@@ -8,15 +8,21 @@ A lightweight, explainable text generation system that learns semantic patterns 
 pip install -r requirements.txt
 ```
 
-## Quick Start
+## Usage
 
-### Train Dual Model
+### 1. Prepare token descriptions (first time only)
+
+```bash
+python main.py build-token-descriptions --data data/corpus.jsonl --out data/token_descriptions.jsonl
+```
+
+### 2. Train dual model
 
 ```bash
 python main.py train-dual --data data/corpus.jsonl --token_desc data/token_descriptions.jsonl --artifacts artifacts
 ```
 
-### Generate Text
+### 3. Generate text
 
 ```bash
 python main.py generate-dual --artifacts artifacts --prompt "Your prompt here" --max_new_tokens 40
@@ -29,11 +35,3 @@ Training data should be in JSONL format:
 ```json
 {"id": "example_001", "text": "Your training text here..."}
 ```
-
-## Configuration
-
-All parameters are configurable via `reasoner/config.py`.
-
-## License
-
-See LICENSE file for details.
